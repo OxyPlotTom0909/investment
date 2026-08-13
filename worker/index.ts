@@ -1,10 +1,10 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { readSnapshot, syncMarketSnapshot, type MarketEnv } from "./market-data";
 
-interface Env {
+interface Env extends MarketEnv {
   ASSETS: Fetcher;
-  DB: D1Database;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -29,6 +29,15 @@ const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname === "/api/market") {
+      try {
+        const snapshot = await readSnapshot(env);
+        return Response.json(snapshot, { headers: { "Cache-Control": "public, max-age=300" } });
+      } catch (error) {
+        return Response.json({ error: error instanceof Error ? error.message : "市場資料暫時無法使用" }, { status: 503 });
+      }
+    }
+
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
       return handleImageOptimization(request, {
@@ -41,6 +50,9 @@ const worker = {
     }
 
     return handler.fetch(request, env, ctx);
+  },
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(syncMarketSnapshot(env));
   },
 };
 
