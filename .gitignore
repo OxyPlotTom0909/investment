@@ -1,0 +1,25 @@
+# Dependencies and generated application output
+node_modules/
+dist/
+.next/
+.vinext/
+.wrangler/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Test, diagnostic, and editor artefacts
+coverage/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Local database files
+*.sqlite
+*.sqlite3
+*.db
