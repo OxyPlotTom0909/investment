@@ -62,8 +62,15 @@ function blobUrl(env: MarketEnv, name: string): URL {
   const account = env.AZURE_STORAGE_ACCOUNT;
   const container = env.AZURE_STORAGE_CONTAINER;
   const rawSas = env.AZURE_STORAGE_SAS?.trim();
-  const sas = rawSas?.match(/(?:^|;)SharedAccessSignature=([^;]+)/i)?.[1]
+  const extractedSas = rawSas?.match(/(?:^|;)SharedAccessSignature=([^;]+)/i)?.[1]
     ?? rawSas?.split("?").at(-1)?.replace(/^\?/, "");
+  let sas = extractedSas;
+  try {
+    const decoded = extractedSas ? decodeURIComponent(extractedSas) : undefined;
+    if (decoded && new URLSearchParams(decoded).has("sv")) sas = decoded;
+  } catch {
+    // Keep the original value; the format validation below produces a safe error.
+  }
   if (!account || !container || !sas) throw new Error("Azure Blob Storage 環境變數尚未完整設定");
   if (!new URLSearchParams(sas).has("sv")) throw new Error("Azure SAS 格式無效");
   return new URL(`https://${account}.blob.core.windows.net/${container}/${name}?${sas}`);
