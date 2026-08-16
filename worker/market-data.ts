@@ -70,7 +70,11 @@ export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
   const response = await fetch(blobUrl(env, "current/market.json"), {
     headers: { "x-ms-version": "2023-11-03" },
   });
-  if (!response.ok) throw new Error(response.status === 404 ? "市場快照尚未建立" : `Azure Blob 讀取失敗：${response.status}`);
+  if (!response.ok) {
+    const azureError = response.headers.get("x-ms-error-code");
+    if (response.status === 404) throw new Error("市場快照尚未建立");
+    throw new Error(`Azure Blob 讀取失敗：${response.status}${azureError ? ` (${azureError})` : ""}`);
+  }
   return response.json() as Promise<MarketSnapshot>;
 }
 
