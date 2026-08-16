@@ -4,6 +4,7 @@ import handler from "vinext/server/app-router-entry";
 import { readSnapshot, syncMarketSnapshot, type MarketEnv } from "./market-data";
 
 interface Env extends MarketEnv {
+  MARKET_SYNC_ADMIN_TOKEN?: string;
   ASSETS: Fetcher;
   IMAGES: {
     input(stream: ReadableStream): {
@@ -28,6 +29,16 @@ interface ExecutionContext {
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/admin/sync") {
+      const expectedToken = env.MARKET_SYNC_ADMIN_TOKEN;
+      const authorization = request.headers.get("Authorization");
+      if (request.method !== "POST" || !expectedToken || authorization !== `Bearer ${expectedToken}`) {
+        return Response.json({ error: "未授權的同步請求" }, { status: 401 });
+      }
+      ctx.waitUntil(syncMarketSnapshot(env));
+      return Response.json({ status: "syncing", message: "已啟動市場快照同步。" }, { status: 202 });
+    }
 
     if (url.pathname === "/api/market") {
       try {
