@@ -1,7 +1,7 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { readSnapshot, readSyncStatus, runMarketSync, type MarketEnv } from "./market-data";
+import { readFundamentalBackfillStatus, readSnapshot, readSyncStatus, runFundamentalBackfill, runMarketSync, type MarketEnv } from "./market-data";
 
 interface Env extends MarketEnv {
   MARKET_SYNC_ADMIN_TOKEN?: string;
@@ -48,6 +48,14 @@ const worker = {
       }
     }
 
+    if (url.pathname === "/api/market/backfill-status") {
+      try {
+        return Response.json(await readFundamentalBackfillStatus(env), { headers: { "Cache-Control": "no-store" } });
+      } catch {
+        return Response.json({ status: "unavailable", message: "歷史回補狀態尚未建立" }, { status: 503 });
+      }
+    }
+
     if (url.pathname === "/api/market") {
       try {
         const snapshot = await readSnapshot(env);
@@ -70,7 +78,11 @@ const worker = {
 
     return handler.fetch(request, env, ctx);
   },
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === "*/10 * * * *") {
+      ctx.waitUntil(runFundamentalBackfill(env));
+      return;
+    }
     ctx.waitUntil(runMarketSync(env));
   },
 };

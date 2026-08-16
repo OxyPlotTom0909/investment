@@ -7,6 +7,17 @@ export interface MarketEnv {
   FINMIND_API_TOKEN?: string;
 }
 
+export type FundamentalBackfillStatus = {
+  status: "not_started" | "running" | "success" | "failed";
+  startedAt: string;
+  finishedAt: string | null;
+  completedCompanies: number;
+  totalCompanies: number;
+  currentTickers: string[];
+  warnings: string[];
+  error: string | null;
+};
+
 export type SyncStatus = {
   status: "not_started" | "success" | "failed" | "running";
   startedAt: string;
@@ -18,10 +29,16 @@ export type SyncStatus = {
 
 type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
+type FinMindFundamentalRow = { date: string; stock_id: string; type?: string; value?: number; revenue?: number; origin_name?: string };
+type FundamentalMetric = { revenueYoY: number | null; roeTtm: number | null; roeTtmPriorYear: number | null; fcfTtm: number | null; asOfDate: string | null; updatedAt: string };
+type FundamentalStore = { version: 1; updatedAt: string; metrics: Record<string, FundamentalMetric> };
 const twseApi = "https://openapi.twse.com.tw/v1";
 const secTickers = "https://www.sec.gov/files/company_tickers_exchange.json";
 const externalRequestTimeoutMs = 12_000;
 const azureRequestTimeoutMs = 10_000;
+const finMindApi = "https://api.finmindtrade.com/api/v4/data";
+const fundamentalStartDate = "2024-01-01";
+const backfillBatchSize = 5;
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
@@ -104,6 +121,90 @@ async function getFinMindPer(env: MarketEnv, date: string): Promise<Map<string, 
   return new Map(payload.data.map((row) => [row.stock_id, row]));
 }
 
+async function getFinMindFundamental(
+  env: MarketEnv,
+  dataset: "TaiwanStockMonthRevenue" | "TaiwanStockFinancialStatements" | "TaiwanStockBalanceSheet" | "TaiwanStockCashFlowsStatement",
+  ticker: string,
+): Promise<FinMindFundamentalRow[]> {
+  if (!env.FINMIND_API_TOKEN) throw new Error("FinMind Token 尚未設定");
+  const url = new URL(finMindApi);
+  url.search = new URLSearchParams({ dataset, data_id: ticker, start_date: fundamentalStartDate }).toString();
+  const response = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${env.FINMIND_API_TOKEN}` } }, `FinMind ${dataset} ${ticker}`, externalRequestTimeoutMs);
+  if (!response.ok) throw new Error(`FinMind ${dataset} ${ticker} 請求失敗：${response.status}`);
+  const payload = await response.json() as { status: number; msg: string; data?: FinMindFundamentalRow[] };
+  if (payload.status !== 200 || !payload.data) throw new Error(`FinMind ${dataset} ${ticker} 不可用：${payload.msg}`);
+  return payload.data;
+}
+
+function metricValue(rows: FinMindFundamentalRow[], date: string, types: string[]): number | null {
+  const matched = rows.find((row) => row.date === date && row.type !== undefined && types.includes(row.type));
+  return matched?.value ?? null;
+}
+
+function quarterValues(rows: FinMindFundamentalRow[], types: string[]): Array<{ date: string; value: number }> {
+  const byDate = new Map<string, number>();
+  for (const row of rows) if (row.type !== undefined && row.value !== undefined && types.includes(row.type)) byDate.set(row.date, row.value);
+  const dates = [...byDate.keys()].sort();
+  const previousYtd = new Map<string, number>();
+  return dates.map((date) => {
+    const year = date.slice(0, 4);
+    const value = byDate.get(date) ?? 0;
+    const previous = previousYtd.get(year) ?? 0;
+    previousYtd.set(year, value);
+    return { date, value: value - previous };
+  });
+}
+
+function trailingSum(values: Array<{ date: string; value: number }>, endIndex: number): number | null {
+  if (endIndex < 3) return null;
+  return values.slice(endIndex - 3, endIndex + 1).reduce((total, item) => total + item.value, 0);
+}
+
+function calculateFundamentalMetric(
+  revenueRows: FinMindFundamentalRow[],
+  incomeRows: FinMindFundamentalRow[],
+  balanceRows: FinMindFundamentalRow[],
+  cashRows: FinMindFundamentalRow[],
+): FundamentalMetric {
+  const revenueByMonth = new Map<string, number>();
+  for (const row of revenueRows) {
+    const revenue = row.revenue ?? row.value;
+    if (revenue !== undefined) revenueByMonth.set(row.date.slice(0, 7), revenue);
+  }
+  const latestMonth = [...revenueByMonth.keys()].sort().at(-1) ?? null;
+  const priorMonth = latestMonth ? `${Number(latestMonth.slice(0, 4)) - 1}${latestMonth.slice(4)}` : null;
+  const currentRevenue = latestMonth ? revenueByMonth.get(latestMonth) ?? null : null;
+  const priorRevenue = priorMonth ? revenueByMonth.get(priorMonth) ?? null : null;
+  const revenueYoY = currentRevenue !== null && priorRevenue !== null && priorRevenue !== 0 ? (currentRevenue - priorRevenue) / Math.abs(priorRevenue) * 100 : null;
+
+  const income = quarterValues(incomeRows, ["IncomeAfterTaxes"]);
+  const operatingCash = quarterValues(cashRows, ["CashFlowsFromOperatingActivities"]);
+  const capitalExpense = quarterValues(cashRows, ["PropertyAndPlantAndEquipment", "AcquisitionOfPropertyPlantAndEquipment"]);
+  const dateSet = new Set([...income.map((item) => item.date), ...operatingCash.map((item) => item.date)]);
+  const dates = [...dateSet].sort();
+  const roeSeries: Array<{ date: string; value: number }> = [];
+  const fcfSeries: Array<{ date: string; value: number }> = [];
+  for (const date of dates) {
+    const incomeIndex = income.findIndex((item) => item.date === date);
+    const cashIndex = operatingCash.findIndex((item) => item.date === date);
+    const capexIndex = capitalExpense.findIndex((item) => item.date === date);
+    const netIncomeTtm = trailingSum(income, incomeIndex);
+    const cashFlowTtm = trailingSum(operatingCash, cashIndex);
+    const capexTtm = trailingSum(capitalExpense, capexIndex);
+    const balanceDates = balanceRows.filter((row) => row.date <= date).map((row) => row.date).sort();
+    const currentEquityDate = balanceDates.at(-1) ?? null;
+    const firstEquityDate = balanceDates.length >= 5 ? balanceDates[balanceDates.length - 5] : null;
+    const currentEquity = currentEquityDate ? metricValue(balanceRows, currentEquityDate, ["TotalEquity", "Equity"]) : null;
+    const firstEquity = firstEquityDate ? metricValue(balanceRows, firstEquityDate, ["TotalEquity", "Equity"]) : null;
+    if (netIncomeTtm !== null && currentEquity !== null && firstEquity !== null && currentEquity + firstEquity !== 0) roeSeries.push({ date, value: netIncomeTtm / ((currentEquity + firstEquity) / 2) * 100 });
+    if (cashFlowTtm !== null && capexTtm !== null) fcfSeries.push({ date, value: cashFlowTtm - Math.abs(capexTtm) });
+  }
+  const latestRoe = roeSeries.at(-1) ?? null;
+  const priorRoe = roeSeries.length >= 5 ? roeSeries[roeSeries.length - 5] : null;
+  const latestFcf = fcfSeries.at(-1) ?? null;
+  return { revenueYoY, roeTtm: latestRoe?.value ?? null, roeTtmPriorYear: priorRoe?.value ?? null, fcfTtm: latestFcf?.value ?? null, asOfDate: latestRoe?.date ?? latestFcf?.date ?? latestMonth, updatedAt: new Date().toISOString() };
+}
+
 function gregorianDate(rocDate: unknown): string | null {
   const matched = String(rocDate ?? "").match(/^(\d{3})(\d{2})(\d{2})$/);
   if (!matched) return null;
@@ -166,6 +267,64 @@ async function writeSyncStatus(env: MarketEnv, status: SyncStatus): Promise<stri
     console.error(message);
     return message;
   }
+}
+
+async function readJsonBlob<T>(env: MarketEnv, name: string): Promise<T | null> {
+  const response = await fetchWithTimeout(blobUrl(env, name), { headers: { "x-ms-version": "2023-11-03" } }, `Azure Blob 讀取 ${name}`, azureRequestTimeoutMs);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Azure Blob 讀取失敗：${response.status}`);
+  return response.json() as Promise<T>;
+}
+
+async function writeFundamentalBackfillStatus(env: MarketEnv, status: FundamentalBackfillStatus): Promise<void> {
+  await writeJsonBlob(env, "status/fundamentals-backfill.json", status);
+}
+
+export async function readFundamentalBackfillStatus(env: MarketEnv): Promise<FundamentalBackfillStatus> {
+  return await readJsonBlob<FundamentalBackfillStatus>(env, "status/fundamentals-backfill.json")
+    ?? { status: "not_started", startedAt: "", finishedAt: null, completedCompanies: 0, totalCompanies: 0, currentTickers: [], warnings: [], error: null };
+}
+
+export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
+  const snapshot = await readSnapshot(env);
+  const tickers = snapshot.companies.filter((company) => company.market === "台股").map((company) => company.ticker).sort();
+  const existing = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
+    ?? { version: 1, updatedAt: "", metrics: {} };
+  const pending = tickers.filter((ticker) => existing.metrics[ticker] === undefined);
+  if (pending.length === 0) {
+    await writeFundamentalBackfillStatus(env, { status: "success", startedAt: existing.updatedAt, finishedAt: new Date().toISOString(), completedCompanies: tickers.length, totalCompanies: tickers.length, currentTickers: [], warnings: [], error: null });
+    return;
+  }
+  const batch = pending.slice(0, backfillBatchSize);
+  const startedAt = new Date().toISOString();
+  await writeFundamentalBackfillStatus(env, { status: "running", startedAt, finishedAt: null, completedCompanies: tickers.length - pending.length, totalCompanies: tickers.length, currentTickers: batch, warnings: [], error: null });
+  const warnings: string[] = [];
+  for (const ticker of batch) {
+    try {
+      const [revenue, income, balance, cash] = await Promise.all([
+        getFinMindFundamental(env, "TaiwanStockMonthRevenue", ticker),
+        getFinMindFundamental(env, "TaiwanStockFinancialStatements", ticker),
+        getFinMindFundamental(env, "TaiwanStockBalanceSheet", ticker),
+        getFinMindFundamental(env, "TaiwanStockCashFlowsStatement", ticker),
+      ]);
+      existing.metrics[ticker] = calculateFundamentalMetric(revenue, income, balance, cash);
+    } catch (error) {
+      warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
+    }
+  }
+  existing.updatedAt = new Date().toISOString();
+  await writeJsonBlob(env, "history/fundamentals/metrics.json", existing);
+  const completedCompanies = tickers.filter((ticker) => existing.metrics[ticker] !== undefined).length;
+  await writeFundamentalBackfillStatus(env, {
+    status: completedCompanies === tickers.length ? "success" : "running",
+    startedAt,
+    finishedAt: completedCompanies === tickers.length ? new Date().toISOString() : null,
+    completedCompanies,
+    totalCompanies: tickers.length,
+    currentTickers: completedCompanies === tickers.length ? [] : tickers.filter((ticker) => existing.metrics[ticker] === undefined).slice(0, backfillBatchSize),
+    warnings,
+    error: null,
+  });
 }
 
 export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
@@ -244,6 +403,9 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     .slice(0, 200)
     .map((company, index) => ({ ...company, marketCapRank: index + 1 }));
 
+  const fundamentalStore = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
+    ?? { version: 1, updatedAt: "", metrics: {} };
+
   const benchmarks = new Map<string, Record<string, number | null>>();
   for (const industry of new Set(topTwCompanies.map((company) => company.industry))) {
     const peers = topTwCompanies.filter((company) => company.industry === industry);
@@ -253,11 +415,15 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
       debtRatio: median(peers.map((company) => company.debtRatio ?? Number.NaN)),
       pe: median(peers.map((company) => company.pe ?? Number.NaN)),
       pb: median(peers.map((company) => company.pb ?? Number.NaN)),
+      revenueYoY: median(peers.map((company) => fundamentalStore.metrics[company.ticker]?.revenueYoY ?? Number.NaN)),
+      roeTtm: median(peers.map((company) => fundamentalStore.metrics[company.ticker]?.roeTtm ?? Number.NaN)),
+      fcfTtm: median(peers.map((company) => fundamentalStore.metrics[company.ticker]?.fcfTtm ?? Number.NaN)),
     });
   }
 
   const twCompanies: Company[] = topTwCompanies.map((company) => {
     const peer = benchmarks.get(company.industry) ?? {};
+    const fundamental = fundamentalStore.metrics[company.ticker];
     const valuation: Valuation = {
       asOfDate: company.priceDate,
       closingPrice: company.closingPrice,
@@ -269,10 +435,14 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
       dividendYield: company.dividendYield,
     };
     const measured: Factor[] = [
+      { id: "revenue-growth", name: "營收成長率", state: comparisonState(fundamental?.revenueYoY ?? null, peer.revenueYoY ?? null, fundamental?.revenueYoY !== undefined && peer.revenueYoY !== undefined && fundamental.revenueYoY >= peer.revenueYoY), value: percent(fundamental?.revenueYoY ?? null), benchmark: peer.revenueYoY === null || peer.revenueYoY === undefined ? null : `同業中位數 ${percent(peer.revenueYoY)}`, period: fundamental?.asOfDate ?? null, note: "最新單月營收相較去年同月", source: "FinMind 月營收表" },
       { id: "eps-growth", name: "EPS 成長", state: company.eps === null ? "unavailable" : company.eps > 0 ? "pass" : "fail", value: company.eps === null ? null : `${company.eps.toFixed(2)} 元`, benchmark: null, period: company.period, note: "目前季累計 EPS；成長趨勢需待歷史資料補齊", source: "TWSE 綜合損益表" },
+      { id: "roe", name: "ROE", state: comparisonState(fundamental?.roeTtm ?? null, peer.roeTtm ?? null, fundamental?.roeTtm !== undefined && peer.roeTtm !== undefined && fundamental.roeTtm >= peer.roeTtm), value: percent(fundamental?.roeTtm ?? null), benchmark: peer.roeTtm === null || peer.roeTtm === undefined ? null : `同業中位數 ${percent(peer.roeTtm)}`, period: fundamental?.asOfDate ?? null, note: "最近四季稅後淨利 ÷ 平均股東權益", source: "FinMind 損益表、資產負債表" },
+      { id: "fcf", name: "自由現金流", state: comparisonState(fundamental?.fcfTtm ?? null, peer.fcfTtm ?? null, fundamental?.fcfTtm !== undefined && peer.fcfTtm !== undefined && fundamental.fcfTtm >= peer.fcfTtm), value: fundamental?.fcfTtm === null || fundamental?.fcfTtm === undefined ? null : `${(fundamental.fcfTtm / 100_000_000).toFixed(0)} 億元`, benchmark: peer.fcfTtm === null || peer.fcfTtm === undefined ? null : `同業中位數 ${(peer.fcfTtm / 100_000_000).toFixed(0)} 億元`, period: fundamental?.asOfDate ?? null, note: "最近四季營業現金流減資本支出", source: "FinMind 現金流量表" },
       { id: "gross-margin", name: "毛利率", state: comparisonState(company.grossMargin, peer.grossMargin ?? null, company.grossMargin !== null && peer.grossMargin !== null && company.grossMargin >= peer.grossMargin), value: percent(company.grossMargin), benchmark: peer.grossMargin === null ? null : `同業中位數 ${percent(peer.grossMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
       { id: "operating-margin", name: "營業利益率", state: comparisonState(company.operatingMargin, peer.operatingMargin ?? null, company.operatingMargin !== null && peer.operatingMargin !== null && company.operatingMargin >= peer.operatingMargin), value: percent(company.operatingMargin), benchmark: peer.operatingMargin === null ? null : `同業中位數 ${percent(peer.operatingMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
       { id: "financial-safety", name: "財務安全", state: comparisonState(company.debtRatio, peer.debtRatio ?? null, company.debtRatio !== null && peer.debtRatio !== null && company.debtRatio <= peer.debtRatio), value: company.debtRatio === null ? null : `負債比 ${percent(company.debtRatio)}`, benchmark: peer.debtRatio === null ? null : `同業中位數 ${percent(peer.debtRatio)}`, period: company.period, note: "目前以負債比作初步比較；金融業另行處理", source: "TWSE 資產負債表" },
+      { id: "roe-trend", name: "ROE 趨勢", state: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? "unavailable" : fundamental.roeTtm >= fundamental.roeTtmPriorYear ? "pass" : "fail", value: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? null : `${fundamental.roeTtm - fundamental.roeTtmPriorYear >= 0 ? "+" : ""}${(fundamental.roeTtm - fundamental.roeTtmPriorYear).toFixed(2)} 個百分點`, benchmark: fundamental?.roeTtmPriorYear === null || fundamental?.roeTtmPriorYear === undefined ? null : `前一年 TTM ROE ${percent(fundamental.roeTtmPriorYear)}`, period: fundamental?.asOfDate ?? null, note: "最近四季 ROE 與前一年同期間比較", source: "FinMind 損益表、資產負債表" },
       { id: "valuation", name: "估值（PE）", state: comparisonState(company.pe, peer.pe ?? null, company.pe !== null && company.pe > 0 && peer.pe !== null && company.pe <= peer.pe), value: multiple(company.pe), benchmark: peer.pe === null ? null : `同業中位數 ${multiple(peer.pe)}`, period: String(company.row.Date ?? ""), note: "正本益比且不高於同業中位數為初步通過", source: "TWSE 本益比、殖利率及股價淨值比" },
       { id: "pb", name: "P/B 合理性", state: comparisonState(company.pb, peer.pb ?? null, company.pb !== null && peer.pb !== null && company.pb <= peer.pb), value: multiple(company.pb), benchmark: peer.pb === null ? null : `同業中位數 ${multiple(peer.pb)}`, period: String(company.row.Date ?? ""), note: "目前以同業中位數比較；歷史分位數待補", source: "TWSE 本益比、殖利率及股價淨值比" },
     ];
