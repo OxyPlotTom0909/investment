@@ -1,4 +1,4 @@
-import type { Company, Factor, MarketSnapshot } from "../shared/market";
+import type { Company, Factor, MarketSnapshot, Valuation } from "../shared/market";
 
 export interface MarketEnv {
   AZURE_STORAGE_ACCOUNT?: string;
@@ -98,40 +98,54 @@ async function writeSnapshot(env: MarketEnv, snapshot: MarketSnapshot): Promise<
 }
 
 export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
-  const [valuations, income, balance, basics, usTickerData] = await Promise.all([
+  const [valuations, prices, income, balance, basics, usTickerData] = await Promise.all([
     getJson<RecordData[]>(`${twseApi}/exchangeReport/BWIBBU_ALL`),
+    getJson<RecordData[]>(`${twseApi}/exchangeReport/STOCK_DAY_ALL`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap06_L_ci`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap07_L_ci`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap03_L`),
     getJson<{ data: Array<[string, string, string, string]> }>(secTickers, { "User-Agent": "InvestmentCompass research@example.invalid" }),
   ]);
 
+  const priceByTicker = new Map(prices.map((row) => [String(row.Code), row]));
   const incomeByTicker = new Map(income.map((row) => [String(row["公司代號"]), row]));
   const balanceByTicker = new Map(balance.map((row) => [String(row["公司代號"]), row]));
-  const industryByTicker = new Map(basics.map((row) => [String(row["公司代號"]), String(row["產業別"] ?? "未分類")]));
+  const basicByTicker = new Map(basics.map((row) => [String(row["公司代號"]), row]));
 
   const rawTwCompanies = valuations.map((row) => {
     const ticker = String(row.Code);
     const statement = incomeByTicker.get(ticker);
     const sheet = balanceByTicker.get(ticker);
+    const basic = basicByTicker.get(ticker);
+    const price = priceByTicker.get(ticker);
     const revenue = numberOf(statement?.["營業收入"]);
     const grossProfit = numberOf(statement?.["營業毛利（毛損）淨額"]);
     const operatingProfit = numberOf(statement?.["營業利益（損失）"]);
     const liabilities = numberOf(sheet?.["負債總計"]);
     const assets = numberOf(sheet?.["資產總計"]);
+    const closingPrice = numberOf(price?.ClosingPrice);
+    const sharesOutstanding = numberOf(basic?.["已發行普通股數或TDR原股發行股數"]);
+    const marketCapTwd = closingPrice !== null && sharesOutstanding !== null ? closingPrice * sharesOutstanding : null;
     return {
-      ticker, name: String(row.Name), industry: industryByTicker.get(ticker) ?? "未分類", row, statement, sheet,
+      ticker, name: String(row.Name), industry: String(basic?.["產業別"] ?? "未分類"), row, statement, sheet,
       grossMargin: revenue && grossProfit !== null ? grossProfit / revenue * 100 : null,
       operatingMargin: revenue && operatingProfit !== null ? operatingProfit / revenue * 100 : null,
       debtRatio: assets && liabilities !== null ? liabilities / assets * 100 : null,
       eps: numberOf(statement?.["基本每股盈餘（元）"]), pe: numberOf(row.PEratio), pb: numberOf(row.PBratio),
-      period: statement ? `${statement.年度 ?? ""} 年第 ${statement.季別 ?? ""} 季` : null,
+      dividendYield: numberOf(row.DividendYield), closingPrice, sharesOutstanding, marketCapTwd,
+      priceDate: price ? String(price.Date ?? "") : null, period: statement ? `${statement.年度 ?? ""} 年第 ${statement.季別 ?? ""} 季` : null,
     };
   });
 
+  const topTwCompanies = rawTwCompanies
+    .filter((company) => company.marketCapTwd !== null)
+    .sort((left, right) => (right.marketCapTwd ?? 0) - (left.marketCapTwd ?? 0))
+    .slice(0, 500)
+    .map((company, index) => ({ ...company, marketCapRank: index + 1 }));
+
   const benchmarks = new Map<string, Record<string, number | null>>();
-  for (const industry of new Set(rawTwCompanies.map((company) => company.industry))) {
-    const peers = rawTwCompanies.filter((company) => company.industry === industry);
+  for (const industry of new Set(topTwCompanies.map((company) => company.industry))) {
+    const peers = topTwCompanies.filter((company) => company.industry === industry);
     benchmarks.set(industry, {
       grossMargin: median(peers.map((company) => company.grossMargin ?? Number.NaN)),
       operatingMargin: median(peers.map((company) => company.operatingMargin ?? Number.NaN)),
@@ -141,8 +155,18 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     });
   }
 
-  const twCompanies: Company[] = rawTwCompanies.map((company) => {
+  const twCompanies: Company[] = topTwCompanies.map((company) => {
     const peer = benchmarks.get(company.industry) ?? {};
+    const valuation: Valuation = {
+      asOfDate: company.priceDate,
+      closingPrice: company.closingPrice,
+      marketCapTwd: company.marketCapTwd,
+      marketCapRank: company.marketCapRank,
+      sharesOutstanding: company.sharesOutstanding,
+      peRatio: company.pe,
+      pbRatio: company.pb,
+      dividendYield: company.dividendYield,
+    };
     const measured: Factor[] = [
       { id: "eps-growth", name: "EPS 成長", state: company.eps === null ? "unavailable" : company.eps > 0 ? "pass" : "fail", value: company.eps === null ? null : `${company.eps.toFixed(2)} 元`, benchmark: null, period: company.period, note: "目前季累計 EPS；成長趨勢需待歷史資料補齊", source: "TWSE 綜合損益表" },
       { id: "gross-margin", name: "毛利率", state: comparisonState(company.grossMargin, peer.grossMargin ?? null, company.grossMargin !== null && peer.grossMargin !== null && company.grossMargin >= peer.grossMargin), value: percent(company.grossMargin), benchmark: peer.grossMargin === null ? null : `同業中位數 ${percent(peer.grossMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
@@ -154,14 +178,14 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     const factors = factorNames.map(([id, name]) => measured.find((factor) => factor.id === id) ?? unavailable(id, name));
     const evaluatedCount = factors.filter((factor) => factor.state !== "unavailable").length;
     const passedCount = factors.filter((factor) => factor.state === "pass").length;
-    return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
+    return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
   });
 
   const usCompanies: Company[] = usTickerData.data
     .filter(([, , , exchange]) => ["Nasdaq", "NYSE", "NYSE American"].includes(exchange))
-    .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+    .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
 
-  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources: ["臺灣證券交易所 OpenAPI", "SEC EDGAR company_tickers_exchange.json"], companies: [...twCompanies, ...usCompanies] };
+  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources: ["臺灣證券交易所 OpenAPI（收盤價、基本資料、財報與估值）", "SEC EDGAR company_tickers_exchange.json"], companies: [...twCompanies, ...usCompanies] };
   await writeSnapshot(env, snapshot);
   return snapshot;
 }
