@@ -38,7 +38,7 @@ const externalRequestTimeoutMs = 12_000;
 const azureRequestTimeoutMs = 10_000;
 const finMindApi = "https://api.finmindtrade.com/api/v4/data";
 const fundamentalStartDate = "2024-01-01";
-const backfillBatchSize = 5;
+const backfillBatchSize = 10;
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
