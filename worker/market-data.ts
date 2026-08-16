@@ -67,7 +67,9 @@ function blobUrl(env: MarketEnv, name: string): URL {
 }
 
 export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
-  const response = await fetch(blobUrl(env, "current/market.json"));
+  const response = await fetch(blobUrl(env, "current/market.json"), {
+    headers: { "x-ms-version": "2023-11-03" },
+  });
   if (!response.ok) throw new Error(response.status === 404 ? "市場快照尚未建立" : `Azure Blob 讀取失敗：${response.status}`);
   return response.json() as Promise<MarketSnapshot>;
 }
