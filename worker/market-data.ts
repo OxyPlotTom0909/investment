@@ -61,8 +61,11 @@ async function getJson<T>(url: string, headers?: HeadersInit): Promise<T> {
 function blobUrl(env: MarketEnv, name: string): URL {
   const account = env.AZURE_STORAGE_ACCOUNT;
   const container = env.AZURE_STORAGE_CONTAINER;
-  const sas = env.AZURE_STORAGE_SAS?.replace(/^\?/, "");
+  const rawSas = env.AZURE_STORAGE_SAS?.trim();
+  const sas = rawSas?.match(/(?:^|;)SharedAccessSignature=([^;]+)/i)?.[1]
+    ?? rawSas?.split("?").at(-1)?.replace(/^\?/, "");
   if (!account || !container || !sas) throw new Error("Azure Blob Storage 環境變數尚未完整設定");
+  if (!new URLSearchParams(sas).has("sv")) throw new Error("Azure SAS 格式無效");
   return new URL(`https://${account}.blob.core.windows.net/${container}/${name}?${sas}`);
 }
 
