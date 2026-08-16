@@ -4,9 +4,11 @@ export interface MarketEnv {
   AZURE_STORAGE_ACCOUNT?: string;
   AZURE_STORAGE_CONTAINER?: string;
   AZURE_STORAGE_SAS?: string;
+  FINMIND_API_TOKEN?: string;
 }
 
 type RecordData = Record<string, string | number | null | undefined>;
+type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 const twseApi = "https://openapi.twse.com.tw/v1";
 const secTickers = "https://www.sec.gov/files/company_tickers_exchange.json";
 const factorNames = [
@@ -56,6 +58,23 @@ async function getJson<T>(url: string, headers?: HeadersInit): Promise<T> {
   const response = await fetch(url, { headers });
   if (!response.ok) throw new Error(`資料來源請求失敗：${response.status}`);
   return response.json() as Promise<T>;
+}
+
+async function getFinMindPer(env: MarketEnv, date: string): Promise<Map<string, FinMindPerRow>> {
+  if (!env.FINMIND_API_TOKEN) throw new Error("FinMind Token 尚未設定");
+  const url = new URL("https://api.finmindtrade.com/api/v4/data");
+  url.search = new URLSearchParams({ dataset: "TaiwanStockPER", start_date: date, end_date: date, token: env.FINMIND_API_TOKEN }).toString();
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`FinMind 估值資料請求失敗：${response.status}`);
+  const payload = await response.json() as { status: number; msg: string; data?: FinMindPerRow[] };
+  if (payload.status !== 200 || !payload.data) throw new Error(`FinMind 估值資料不可用：${payload.msg}`);
+  return new Map(payload.data.map((row) => [row.stock_id, row]));
+}
+
+function gregorianDate(rocDate: unknown): string | null {
+  const matched = String(rocDate ?? "").match(/^(\d{3})(\d{2})(\d{2})$/);
+  if (!matched) return null;
+  return `${Number(matched[1]) + 1911}-${matched[2]}-${matched[3]}`;
 }
 
 function blobUrl(env: MarketEnv, name: string): URL {
@@ -111,6 +130,8 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   const incomeByTicker = new Map(income.map((row) => [String(row["公司代號"]), row]));
   const balanceByTicker = new Map(balance.map((row) => [String(row["公司代號"]), row]));
   const basicByTicker = new Map(basics.map((row) => [String(row["公司代號"]), row]));
+  const finMindDate = gregorianDate(valuations[0]?.Date);
+  const finMindPerByTicker = finMindDate ? await getFinMindPer(env, finMindDate) : new Map<string, FinMindPerRow>();
 
   const rawTwCompanies = valuations.map((row) => {
     const ticker = String(row.Code);
@@ -118,6 +139,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     const sheet = balanceByTicker.get(ticker);
     const basic = basicByTicker.get(ticker);
     const price = priceByTicker.get(ticker);
+    const finMindPer = finMindPerByTicker.get(ticker);
     const revenue = numberOf(statement?.["營業收入"]);
     const grossProfit = numberOf(statement?.["營業毛利（毛損）淨額"]);
     const operatingProfit = numberOf(statement?.["營業利益（損失）"]);
@@ -131,8 +153,8 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
       grossMargin: revenue && grossProfit !== null ? grossProfit / revenue * 100 : null,
       operatingMargin: revenue && operatingProfit !== null ? operatingProfit / revenue * 100 : null,
       debtRatio: assets && liabilities !== null ? liabilities / assets * 100 : null,
-      eps: numberOf(statement?.["基本每股盈餘（元）"]), pe: numberOf(row.PEratio), pb: numberOf(row.PBratio),
-      dividendYield: numberOf(row.DividendYield), closingPrice, sharesOutstanding, marketCapTwd,
+      eps: numberOf(statement?.["基本每股盈餘（元）"]), pe: finMindPer?.PER ?? numberOf(row.PEratio), pb: finMindPer?.PBR ?? numberOf(row.PBratio),
+      dividendYield: finMindPer?.dividend_yield ?? numberOf(row.DividendYield), closingPrice, sharesOutstanding, marketCapTwd,
       priceDate: price ? String(price.Date ?? "") : null, period: statement ? `${statement.年度 ?? ""} 年第 ${statement.季別 ?? ""} 季` : null,
     };
   });
@@ -185,7 +207,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     .filter(([, , , exchange]) => ["Nasdaq", "NYSE", "NYSE American"].includes(exchange))
     .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
 
-  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources: ["臺灣證券交易所 OpenAPI（收盤價、基本資料、財報與估值）", "SEC EDGAR company_tickers_exchange.json"], companies: [...twCompanies, ...usCompanies] };
+  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources: ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）", "FinMind（PE、P/B、殖利率）", "SEC EDGAR company_tickers_exchange.json"], companies: [...twCompanies, ...usCompanies] };
   await writeSnapshot(env, snapshot);
   return snapshot;
 }
