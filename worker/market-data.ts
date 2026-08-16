@@ -325,6 +325,7 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
     warnings,
     error: null,
   });
+  if (completedCompanies === tickers.length) await runMarketSync(env);
 }
 
 export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
