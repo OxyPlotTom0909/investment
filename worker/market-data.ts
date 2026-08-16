@@ -140,7 +140,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   const topTwCompanies = rawTwCompanies
     .filter((company) => company.marketCapTwd !== null)
     .sort((left, right) => (right.marketCapTwd ?? 0) - (left.marketCapTwd ?? 0))
-    .slice(0, 500)
+    .slice(0, 200)
     .map((company, index) => ({ ...company, marketCapRank: index + 1 }));
 
   const benchmarks = new Map<string, Record<string, number | null>>();
