@@ -7,6 +7,15 @@ export interface MarketEnv {
   FINMIND_API_TOKEN?: string;
 }
 
+export type SyncStatus = {
+  status: "success" | "failed" | "running";
+  startedAt: string;
+  finishedAt: string | null;
+  companyCount: number | null;
+  warnings: string[];
+  error: string | null;
+};
+
 type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 const twseApi = "https://openapi.twse.com.tw/v1";
@@ -108,30 +117,72 @@ export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
 }
 
 async function writeSnapshot(env: MarketEnv, snapshot: MarketSnapshot): Promise<void> {
-  const response = await fetch(blobUrl(env, "current/market.json"), {
+  await writeJsonBlob(env, "current/market.json", snapshot);
+}
+
+async function writeJsonBlob(env: MarketEnv, name: string, body: unknown): Promise<void> {
+  const response = await fetch(blobUrl(env, name), {
     method: "PUT",
     headers: { "x-ms-blob-type": "BlockBlob", "x-ms-version": "2023-11-03", "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(snapshot),
+    body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`Azure Blob 寫入失敗：${response.status}`);
+  if (!response.ok) {
+    const azureError = response.headers.get("x-ms-error-code");
+    throw new Error(`Azure Blob 寫入失敗：${response.status}${azureError ? ` (${azureError})` : ""}`);
+  }
+}
+
+async function writeSyncStatus(env: MarketEnv, status: SyncStatus): Promise<void> {
+  try {
+    await writeJsonBlob(env, "status/market-sync.json", status);
+  } catch {
+    // A status-recording failure must not hide the original data-sync result.
+  }
+}
+
+export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
+  const response = await fetch(blobUrl(env, "status/market-sync.json"), {
+    headers: { "x-ms-version": "2023-11-03" },
+  });
+  if (response.status === 404) {
+    return { status: "running", startedAt: "", finishedAt: null, companyCount: null, warnings: [], error: null };
+  }
+  if (!response.ok) throw new Error(`同步狀態讀取失敗：${response.status}`);
+  return response.json() as Promise<SyncStatus>;
 }
 
 export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
-  const [valuations, prices, income, balance, basics, usTickerData] = await Promise.all([
+  const [valuations, prices, income, balance, basics] = await Promise.all([
     getJson<RecordData[]>(`${twseApi}/exchangeReport/BWIBBU_ALL`),
     getJson<RecordData[]>(`${twseApi}/exchangeReport/STOCK_DAY_ALL`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap06_L_ci`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap07_L_ci`),
     getJson<RecordData[]>(`${twseApi}/opendata/t187ap03_L`),
-    getJson<{ data: Array<[string, string, string, string]> }>(secTickers, { "User-Agent": "InvestmentCompass research@example.invalid" }),
   ]);
 
   const priceByTicker = new Map(prices.map((row) => [String(row.Code), row]));
   const incomeByTicker = new Map(income.map((row) => [String(row["公司代號"]), row]));
   const balanceByTicker = new Map(balance.map((row) => [String(row["公司代號"]), row]));
   const basicByTicker = new Map(basics.map((row) => [String(row["公司代號"]), row]));
+  const warnings: string[] = [];
   const finMindDate = gregorianDate(valuations[0]?.Date);
-  const finMindPerByTicker = finMindDate ? await getFinMindPer(env, finMindDate) : new Map<string, FinMindPerRow>();
+  let finMindPerByTicker = new Map<string, FinMindPerRow>();
+  if (finMindDate) {
+    try {
+      finMindPerByTicker = await getFinMindPer(env, finMindDate);
+    } catch {
+      warnings.push("FinMind 估值資料暫時不可用，已改用 TWSE 估值欄位。");
+    }
+  } else {
+    warnings.push("無法辨識 TWSE 資料日期，未取得 FinMind 估值資料。");
+  }
+
+  let usTickerData: { data: Array<[string, string, string, string]> } = { data: [] };
+  try {
+    usTickerData = await getJson<{ data: Array<[string, string, string, string]> }>(secTickers, { "User-Agent": "InvestmentCompass contact@bezierline.workers.dev" });
+  } catch {
+    warnings.push("SEC 美股名單暫時不可用，本次快照不含美股名單。");
+  }
 
   const rawTwCompanies = valuations.map((row) => {
     const ticker = String(row.Code);
@@ -207,7 +258,34 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     .filter(([, , , exchange]) => ["Nasdaq", "NYSE", "NYSE American"].includes(exchange))
     .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
 
-  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources: ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）", "FinMind（PE、P/B、殖利率）", "SEC EDGAR company_tickers_exchange.json"], companies: [...twCompanies, ...usCompanies] };
+  const sources = ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）"];
+  if (finMindPerByTicker.size > 0) sources.push("FinMind（PE、P/B、殖利率）");
+  if (usTickerData.data.length > 0) sources.push("SEC EDGAR company_tickers_exchange.json");
+  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources, companies: [...twCompanies, ...usCompanies] };
   await writeSnapshot(env, snapshot);
+  if (warnings.length > 0) {
+    await writeSyncStatus(env, { status: "success", startedAt: snapshot.generatedAt, finishedAt: new Date().toISOString(), companyCount: snapshot.companies.length, warnings, error: null });
+  }
   return snapshot;
+}
+
+export async function runMarketSync(env: MarketEnv): Promise<void> {
+  const startedAt = new Date().toISOString();
+  await writeSyncStatus(env, { status: "running", startedAt, finishedAt: null, companyCount: null, warnings: [], error: null });
+  try {
+    const snapshot = await syncMarketSnapshot(env);
+    const currentStatus = await readSyncStatus(env).catch(() => null);
+    await writeSyncStatus(env, {
+      status: "success",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      companyCount: snapshot.companies.length,
+      warnings: currentStatus?.status === "success" ? currentStatus.warnings : [],
+      error: null,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知同步錯誤";
+    await writeSyncStatus(env, { status: "failed", startedAt, finishedAt: new Date().toISOString(), companyCount: null, warnings: [], error: message.slice(0, 240) });
+    throw error;
+  }
 }

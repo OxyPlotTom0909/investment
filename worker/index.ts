@@ -1,7 +1,7 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { readSnapshot, syncMarketSnapshot, type MarketEnv } from "./market-data";
+import { readSnapshot, readSyncStatus, runMarketSync, type MarketEnv } from "./market-data";
 
 interface Env extends MarketEnv {
   MARKET_SYNC_ADMIN_TOKEN?: string;
@@ -36,8 +36,16 @@ const worker = {
       if (request.method !== "POST" || !expectedToken || authorization !== `Bearer ${expectedToken}`) {
         return Response.json({ error: "未授權的同步請求" }, { status: 401 });
       }
-      ctx.waitUntil(syncMarketSnapshot(env));
+      ctx.waitUntil(runMarketSync(env));
       return Response.json({ status: "syncing", message: "已啟動市場快照同步。" }, { status: 202 });
+    }
+
+    if (url.pathname === "/api/market/status") {
+      try {
+        return Response.json(await readSyncStatus(env), { headers: { "Cache-Control": "no-store" } });
+      } catch {
+        return Response.json({ status: "unavailable", message: "同步狀態尚未建立" }, { status: 503 });
+      }
     }
 
     if (url.pathname === "/api/market") {
@@ -63,7 +71,7 @@ const worker = {
     return handler.fetch(request, env, ctx);
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(syncMarketSnapshot(env));
+    ctx.waitUntil(runMarketSync(env));
   },
 };
 
