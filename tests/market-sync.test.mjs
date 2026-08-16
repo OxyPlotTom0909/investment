@@ -7,6 +7,28 @@ async function loadWorker() {
   return (await import(workerUrl.href)).default;
 }
 
+test("尚未建立同步狀態檔時回傳 not_started，而非 running", async () => {
+  const worker = await loadWorker();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.hostname === "testaccount.blob.core.windows.net") return new Response(null, { status: 404 });
+    throw new Error(`Unexpected test request: ${url.hostname}`);
+  };
+
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/market/status"), {
+      AZURE_STORAGE_ACCOUNT: "testaccount",
+      AZURE_STORAGE_CONTAINER: "market-data",
+      AZURE_STORAGE_SAS: "sv=test&sig=not-a-secret",
+    }, { waitUntil() {}, passThroughOnException() {} });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, "not_started");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async () => {
   const worker = await loadWorker();
   const originalFetch = globalThis.fetch;
@@ -62,4 +84,48 @@ test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async
   assert.equal(status.status, "success");
   assert.match(status.warnings.join(" "), /FinMind/);
   assert.match(status.warnings.join(" "), /SEC/);
+});
+
+test("TWSE 請求逾時會結束同步並記錄可診斷失敗狀態", { timeout: 15_000 }, async () => {
+  const worker = await loadWorker();
+  const originalFetch = globalThis.fetch;
+  const blobs = new Map();
+  let scheduledPromise;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.hostname === "openapi.twse.com.tw") {
+      return new Promise((_, reject) => {
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    if (url.hostname === "testaccount.blob.core.windows.net") {
+      const key = url.pathname.replace("/market-data/", "");
+      if ((init.method ?? "GET") === "PUT") {
+        blobs.set(key, JSON.parse(String(init.body)));
+        return new Response(null, { status: 201 });
+      }
+      const body = blobs.get(key);
+      return body ? Response.json(body) : new Response(null, { status: 404 });
+    }
+    throw new Error(`Unexpected test request: ${url.hostname}`);
+  };
+
+  try {
+    await worker.scheduled({}, {
+      AZURE_STORAGE_ACCOUNT: "testaccount",
+      AZURE_STORAGE_CONTAINER: "market-data",
+      AZURE_STORAGE_SAS: "sv=test&sig=not-a-secret",
+    }, {
+      waitUntil(promise) { scheduledPromise = promise; },
+      passThroughOnException() {},
+    });
+    await assert.rejects(scheduledPromise, /TWSE.*請求逾時/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const status = blobs.get("status/market-sync.json");
+  assert.equal(status.status, "failed");
+  assert.match(status.error, /TWSE.*請求逾時/);
 });

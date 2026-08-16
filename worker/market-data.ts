@@ -8,7 +8,7 @@ export interface MarketEnv {
 }
 
 export type SyncStatus = {
-  status: "success" | "failed" | "running";
+  status: "not_started" | "success" | "failed" | "running";
   startedAt: string;
   finishedAt: string | null;
   companyCount: number | null;
@@ -20,6 +20,8 @@ type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 const twseApi = "https://openapi.twse.com.tw/v1";
 const secTickers = "https://www.sec.gov/files/company_tickers_exchange.json";
+const externalRequestTimeoutMs = 12_000;
+const azureRequestTimeoutMs = 10_000;
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
@@ -63,9 +65,31 @@ function grade(evaluatedCount: number, passedCount: number): Company["grade"] {
   return "C";
 }
 
-async function getJson<T>(url: string, headers?: HeadersInit): Promise<T> {
-  const response = await fetch(url, { headers });
-  if (!response.ok) throw new Error(`資料來源請求失敗：${response.status}`);
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "未知錯誤";
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  source: string,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`${source} 請求逾時（${Math.round(timeoutMs / 1000)} 秒）`);
+    throw new Error(`${source} 連線失敗：${errorMessage(error).slice(0, 160)}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getJson<T>(url: string, source: string, headers?: HeadersInit): Promise<T> {
+  const response = await fetchWithTimeout(url, { headers }, source, externalRequestTimeoutMs);
+  if (!response.ok) throw new Error(`${source} 請求失敗：${response.status}`);
   return response.json() as Promise<T>;
 }
 
@@ -73,7 +97,7 @@ async function getFinMindPer(env: MarketEnv, date: string): Promise<Map<string, 
   if (!env.FINMIND_API_TOKEN) throw new Error("FinMind Token 尚未設定");
   const url = new URL("https://api.finmindtrade.com/api/v4/data");
   url.search = new URLSearchParams({ dataset: "TaiwanStockPER", start_date: date, end_date: date, token: env.FINMIND_API_TOKEN }).toString();
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url, {}, "FinMind 估值資料", externalRequestTimeoutMs);
   if (!response.ok) throw new Error(`FinMind 估值資料請求失敗：${response.status}`);
   const payload = await response.json() as { status: number; msg: string; data?: FinMindPerRow[] };
   if (payload.status !== 200 || !payload.data) throw new Error(`FinMind 估值資料不可用：${payload.msg}`);
@@ -105,9 +129,9 @@ function blobUrl(env: MarketEnv, name: string): URL {
 }
 
 export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
-  const response = await fetch(blobUrl(env, "current/market.json"), {
+  const response = await fetchWithTimeout(blobUrl(env, "current/market.json"), {
     headers: { "x-ms-version": "2023-11-03" },
-  });
+  }, "Azure Blob 市場快照", azureRequestTimeoutMs);
   if (!response.ok) {
     const azureError = response.headers.get("x-ms-error-code");
     if (response.status === 404) throw new Error("市場快照尚未建立");
@@ -121,31 +145,35 @@ async function writeSnapshot(env: MarketEnv, snapshot: MarketSnapshot): Promise<
 }
 
 async function writeJsonBlob(env: MarketEnv, name: string, body: unknown): Promise<void> {
-  const response = await fetch(blobUrl(env, name), {
+  const response = await fetchWithTimeout(blobUrl(env, name), {
     method: "PUT",
     headers: { "x-ms-blob-type": "BlockBlob", "x-ms-version": "2023-11-03", "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(body),
-  });
+  }, `Azure Blob 寫入 ${name}`, azureRequestTimeoutMs);
   if (!response.ok) {
     const azureError = response.headers.get("x-ms-error-code");
     throw new Error(`Azure Blob 寫入失敗：${response.status}${azureError ? ` (${azureError})` : ""}`);
   }
 }
 
-async function writeSyncStatus(env: MarketEnv, status: SyncStatus): Promise<void> {
+async function writeSyncStatus(env: MarketEnv, status: SyncStatus): Promise<string | null> {
   try {
     await writeJsonBlob(env, "status/market-sync.json", status);
-  } catch {
-    // A status-recording failure must not hide the original data-sync result.
+    return null;
+  } catch (error) {
+    const message = `同步狀態寫入失敗：${errorMessage(error).slice(0, 180)}`;
+    // Keep the cause in Worker logs when Azure is unavailable. Never log secrets.
+    console.error(message);
+    return message;
   }
 }
 
 export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
-  const response = await fetch(blobUrl(env, "status/market-sync.json"), {
+  const response = await fetchWithTimeout(blobUrl(env, "status/market-sync.json"), {
     headers: { "x-ms-version": "2023-11-03" },
-  });
+  }, "Azure Blob 同步狀態", azureRequestTimeoutMs);
   if (response.status === 404) {
-    return { status: "running", startedAt: "", finishedAt: null, companyCount: null, warnings: [], error: null };
+    return { status: "not_started", startedAt: "", finishedAt: null, companyCount: null, warnings: [], error: null };
   }
   if (!response.ok) throw new Error(`同步狀態讀取失敗：${response.status}`);
   return response.json() as Promise<SyncStatus>;
@@ -153,11 +181,11 @@ export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
 
 export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
   const [valuations, prices, income, balance, basics] = await Promise.all([
-    getJson<RecordData[]>(`${twseApi}/exchangeReport/BWIBBU_ALL`),
-    getJson<RecordData[]>(`${twseApi}/exchangeReport/STOCK_DAY_ALL`),
-    getJson<RecordData[]>(`${twseApi}/opendata/t187ap06_L_ci`),
-    getJson<RecordData[]>(`${twseApi}/opendata/t187ap07_L_ci`),
-    getJson<RecordData[]>(`${twseApi}/opendata/t187ap03_L`),
+    getJson<RecordData[]>(`${twseApi}/exchangeReport/BWIBBU_ALL`, "TWSE 本益比、殖利率及股價淨值比"),
+    getJson<RecordData[]>(`${twseApi}/exchangeReport/STOCK_DAY_ALL`, "TWSE 每日收盤價"),
+    getJson<RecordData[]>(`${twseApi}/opendata/t187ap06_L_ci`, "TWSE 綜合損益表"),
+    getJson<RecordData[]>(`${twseApi}/opendata/t187ap07_L_ci`, "TWSE 資產負債表"),
+    getJson<RecordData[]>(`${twseApi}/opendata/t187ap03_L`, "TWSE 上市公司基本資料"),
   ]);
 
   const priceByTicker = new Map(prices.map((row) => [String(row.Code), row]));
@@ -170,8 +198,8 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   if (finMindDate) {
     try {
       finMindPerByTicker = await getFinMindPer(env, finMindDate);
-    } catch {
-      warnings.push("FinMind 估值資料暫時不可用，已改用 TWSE 估值欄位。");
+    } catch (error) {
+      warnings.push(`FinMind 估值資料暫時不可用，已改用 TWSE 估值欄位（${errorMessage(error).slice(0, 160)}）。`);
     }
   } else {
     warnings.push("無法辨識 TWSE 資料日期，未取得 FinMind 估值資料。");
@@ -179,9 +207,9 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
 
   let usTickerData: { data: Array<[string, string, string, string]> } = { data: [] };
   try {
-    usTickerData = await getJson<{ data: Array<[string, string, string, string]> }>(secTickers, { "User-Agent": "InvestmentCompass contact@bezierline.workers.dev" });
-  } catch {
-    warnings.push("SEC 美股名單暫時不可用，本次快照不含美股名單。");
+    usTickerData = await getJson<{ data: Array<[string, string, string, string]> }>(secTickers, "SEC 美股名單", { "User-Agent": "InvestmentCompass contact@bezierline.workers.dev" });
+  } catch (error) {
+    warnings.push(`SEC 美股名單暫時不可用，本次快照不含美股名單（${errorMessage(error).slice(0, 160)}）。`);
   }
 
   const rawTwCompanies = valuations.map((row) => {
