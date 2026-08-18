@@ -23,5 +23,8 @@ test("renders the investment research MVP", async () => {
   assert.match(html, /台股與美股風險評估/);
   assert.match(html, /資料讀取中/);
   assert.match(html, /不構成投資建議/);
+  assert.match(html, /護城河評估標準/);
+  assert.match(html, /以 5 項可追溯證據評分/);
+  assert.match(html, /獲利持續性/);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton|codex-preview/);
 });

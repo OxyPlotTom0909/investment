@@ -67,6 +67,13 @@ function multiple(value: number | null): string | null {
 }
 
 function unavailable(id: string, name: string): Factor {
+  if (id === "moat") {
+    return {
+      id, name, state: "unavailable", value: null, benchmark: null, period: null,
+      note: "採 5 項可追溯證據：獲利持續性、市占／競爭地位、轉換成本、無形資產、資本效率；至少取得 3 項來源後才評分。",
+      source: "待補：年報、法說會、MOPS、專利／商標與產業報告",
+    };
+  }
   return { id, name, state: "unavailable", value: null, benchmark: null, period: null, note: "尚無可比較的已驗證資料", source: "待補資料來源" };
 }
 
