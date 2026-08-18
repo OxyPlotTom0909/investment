@@ -76,7 +76,7 @@ function comparisonState(value: number | null, benchmark: number | null, passes:
 }
 
 function grade(evaluatedCount: number, passedCount: number): Company["grade"] {
-  if (evaluatedCount < 11) return "資料不足";
+  if (evaluatedCount === 0) return "資料不足";
   if (passedCount >= 8) return "A";
   if (passedCount >= 5) return "B";
   return "C";
@@ -366,10 +366,21 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   }
 
   let usTickerData: { data: Array<[string, string, string, string]> } = { data: [] };
+  let fallbackUsCompanies: Company[] = [];
   try {
     usTickerData = await getJson<{ data: Array<[string, string, string, string]> }>(secTickers, "SEC 美股名單", { "User-Agent": "InvestmentCompass contact@bezierline.workers.dev" });
   } catch (error) {
-    warnings.push(`SEC 美股名單暫時不可用，本次快照不含美股名單（${errorMessage(error).slice(0, 160)}）。`);
+    try {
+      const existingSnapshot = await readSnapshot(env);
+      fallbackUsCompanies = existingSnapshot.companies.filter((company) => company.market === "美股");
+      if (fallbackUsCompanies.length > 0) {
+        warnings.push(`SEC 美股名單暫時不可用，已保留前次快照的 ${fallbackUsCompanies.length} 檔美股名單（${errorMessage(error).slice(0, 160)}）。`);
+      } else {
+        warnings.push(`SEC 美股名單暫時不可用，且前次快照沒有可保留的美股名單（${errorMessage(error).slice(0, 160)}）。`);
+      }
+    } catch (fallbackError) {
+      warnings.push(`SEC 美股名單暫時不可用，且無法讀取前次快照作為備援（${errorMessage(fallbackError).slice(0, 160)}）。`);
+    }
   }
 
   const rawTwCompanies = valuations.map((row) => {
@@ -453,13 +464,15 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
   });
 
-  const usCompanies: Company[] = usTickerData.data
+  const fetchedUsCompanies: Company[] = usTickerData.data
     .filter(([, , , exchange]) => ["Nasdaq", "NYSE", "NYSE American"].includes(exchange))
     .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+  const usCompanies = fetchedUsCompanies.length > 0 ? fetchedUsCompanies : fallbackUsCompanies;
 
   const sources = ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）"];
   if (finMindPerByTicker.size > 0) sources.push("FinMind（PE、P/B、殖利率）");
-  if (usTickerData.data.length > 0) sources.push("SEC EDGAR company_tickers_exchange.json");
+  if (fetchedUsCompanies.length > 0) sources.push("SEC EDGAR company_tickers_exchange.json");
+  if (fallbackUsCompanies.length > 0) sources.push("前次市場快照（美股名單備援）");
   const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources, companies: [...twCompanies, ...usCompanies] };
   await writeSnapshot(env, snapshot);
   if (warnings.length > 0) {
