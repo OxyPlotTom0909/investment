@@ -19,9 +19,9 @@ test("renders the investment research MVP", async () => {
   const html = await response.text();
 
   assert.match(html, /Investment Compass｜上市公司研究 MVP/);
-  assert.match(html, /11 項全數可評後：A ≥ 8、B 5–7、C ≤ 4/);
+  assert.match(html, /A ≥ 8、B 5–7、C ≤ 4；未具可評資料則標示資料不足/);
   assert.match(html, /台股與美股風險評估/);
-  assert.match(html, /正在讀取 Azure Blob Storage 的市場快照/);
+  assert.match(html, /資料讀取中/);
   assert.match(html, /不構成投資建議/);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton|codex-preview/);
 });
