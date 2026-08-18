@@ -1,4 +1,4 @@
-import type { Company, Factor, MarketSnapshot, Valuation } from "../shared/market";
+import type { Company, Factor, MarketSnapshot, MoatEvidence, Valuation } from "../shared/market";
 
 export interface MarketEnv {
   AZURE_STORAGE_ACCOUNT?: string;
@@ -30,8 +30,17 @@ export type SyncStatus = {
 type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 type FinMindFundamentalRow = { date: string; stock_id: string; type?: string; value?: number; revenue?: number; origin_name?: string };
-type FundamentalMetric = { revenueYoY: number | null; roeTtm: number | null; roeTtmPriorYear: number | null; fcfTtm: number | null; asOfDate: string | null; updatedAt: string };
-type FundamentalStore = { version: 1; updatedAt: string; metrics: Record<string, FundamentalMetric> };
+type FundamentalMetric = {
+  revenueYoY: number | null;
+  roeTtm: number | null;
+  roeTtmPriorYear: number | null;
+  fcfTtm: number | null;
+  netIncomeTtm: number | null;
+  positiveNetIncomeQuarters: number;
+  asOfDate: string | null;
+  updatedAt: string;
+};
+type FundamentalStore = { version: 1 | 2; updatedAt: string; metrics: Record<string, FundamentalMetric> };
 const twseApi = "https://openapi.twse.com.tw/v1";
 const secTickers = "https://www.sec.gov/files/company_tickers_exchange.json";
 const externalRequestTimeoutMs = 12_000;
@@ -209,7 +218,76 @@ function calculateFundamentalMetric(
   const latestRoe = roeSeries.at(-1) ?? null;
   const priorRoe = roeSeries.length >= 5 ? roeSeries[roeSeries.length - 5] : null;
   const latestFcf = fcfSeries.at(-1) ?? null;
-  return { revenueYoY, roeTtm: latestRoe?.value ?? null, roeTtmPriorYear: priorRoe?.value ?? null, fcfTtm: latestFcf?.value ?? null, asOfDate: latestRoe?.date ?? latestFcf?.date ?? latestMonth, updatedAt: new Date().toISOString() };
+  const latestIncomeIndex = income.length - 1;
+  const latestIncomeTtm = trailingSum(income, latestIncomeIndex);
+  const latestIncomeQuarters = income.slice(-4);
+  const positiveNetIncomeQuarters = latestIncomeQuarters.length === 4
+    ? latestIncomeQuarters.filter((item) => item.value > 0).length
+    : 0;
+  return {
+    revenueYoY,
+    roeTtm: latestRoe?.value ?? null,
+    roeTtmPriorYear: priorRoe?.value ?? null,
+    fcfTtm: latestFcf?.value ?? null,
+    netIncomeTtm: latestIncomeTtm,
+    positiveNetIncomeQuarters,
+    asOfDate: latestRoe?.date ?? latestFcf?.date ?? income.at(-1)?.date ?? latestMonth,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function buildMoatFactor(
+  fundamental: FundamentalMetric | undefined,
+  peerRoeTtm: number | null | undefined,
+): Factor {
+  const asOfDate = fundamental?.asOfDate;
+  const evidence: MoatEvidence[] = [];
+
+  if (asOfDate && fundamental?.netIncomeTtm !== null && fundamental?.netIncomeTtm !== undefined && fundamental.positiveNetIncomeQuarters === 4) {
+    evidence.push({
+      criterion: "獲利持續性",
+      result: "supported",
+      observation: "最近四季稅後淨利皆為正數。",
+      source: "FinMind TaiwanStockFinancialStatements（公開財報資料）",
+      sourceUrl: "https://finmind.github.io/taiwan_stock.html#taiwanstockfinancialstatements",
+      asOfDate,
+      confidence: "high",
+    });
+  }
+
+  if (asOfDate && fundamental?.roeTtm !== null && fundamental?.roeTtm !== undefined && peerRoeTtm !== null && peerRoeTtm !== undefined) {
+    const supported = fundamental.roeTtm >= peerRoeTtm && fundamental.roeTtm > 0;
+    evidence.push({
+      criterion: "資本效率",
+      result: supported ? "supported" : "not_supported",
+      observation: supported
+        ? `最近四季 ROE ${fundamental.roeTtm.toFixed(2)}%，不低於同業中位數 ${peerRoeTtm.toFixed(2)}%。`
+        : `最近四季 ROE ${fundamental.roeTtm.toFixed(2)}%，未達同業中位數 ${peerRoeTtm.toFixed(2)}%。`,
+      source: "FinMind TaiwanStockFinancialStatements、TaiwanStockBalanceSheet（公開財報資料）",
+      sourceUrl: "https://finmind.github.io/taiwan_stock.html#taiwanstockbalancesheet",
+      asOfDate,
+      confidence: "high",
+    });
+  }
+
+  const supportedCount = evidence.filter((item) => item.result === "supported").length;
+  const evidenceCount = evidence.length;
+  return {
+    id: "moat",
+    name: "護城河",
+    // Structured financial data can only validate two of the five criteria.
+    // Keep the outcome unavailable until public evidence for the remaining
+    // qualitative criteria is acquired; this avoids presenting an inference as fact.
+    state: "unavailable",
+    value: evidenceCount === 0 ? null : `${supportedCount}/${evidenceCount} 項量化佐證`,
+    benchmark: null,
+    period: asOfDate ?? null,
+    note: evidenceCount === 0
+      ? "尚無足夠的四季公開財報資料可驗證獲利持續性與資本效率。"
+      : `已取得 ${evidenceCount} 項可追溯量化佐證；競爭地位、轉換成本與無形資產尚缺官方結構化證據。依規則暫不判定護城河強弱。`,
+    source: evidenceCount === 0 ? "待補：公開年報、法說會、專利／商標與產業市占資料" : "FinMind 公開財報資料（詳見佐證）",
+    evidence,
+  };
 }
 
 function gregorianDate(rocDate: unknown): string | null {
@@ -296,8 +374,15 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
   const snapshot = await readSnapshot(env);
   const tickers = snapshot.companies.filter((company) => company.market === "台股").map((company) => company.ticker).sort();
   const existing = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
-    ?? { version: 1, updatedAt: "", metrics: {} };
-  const pending = tickers.filter((ticker) => existing.metrics[ticker] === undefined);
+    ?? { version: 2, updatedAt: "", metrics: {} };
+  // Version 2 adds the four-quarter profit fields required for conservative
+  // moat evidence. Re-fetch only records which predate that schema.
+  const pending = tickers.filter((ticker) => {
+    const metric = existing.metrics[ticker];
+    return metric === undefined
+      || metric.netIncomeTtm === undefined
+      || metric.positiveNetIncomeQuarters === undefined;
+  });
   if (pending.length === 0) {
     await writeFundamentalBackfillStatus(env, { status: "success", startedAt: existing.updatedAt, finishedAt: new Date().toISOString(), completedCompanies: tickers.length, totalCompanies: tickers.length, currentTickers: [], warnings: [], error: null });
     return;
@@ -319,9 +404,15 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
       warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
     }
   }
+  existing.version = 2;
   existing.updatedAt = new Date().toISOString();
   await writeJsonBlob(env, "history/fundamentals/metrics.json", existing);
-  const completedCompanies = tickers.filter((ticker) => existing.metrics[ticker] !== undefined).length;
+  const completedCompanies = tickers.filter((ticker) => {
+    const metric = existing.metrics[ticker];
+    return metric !== undefined
+      && metric.netIncomeTtm !== undefined
+      && metric.positiveNetIncomeQuarters !== undefined;
+  }).length;
   await writeFundamentalBackfillStatus(env, {
     status: completedCompanies === tickers.length ? "success" : "running",
     startedAt,
@@ -462,6 +553,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
       { id: "operating-margin", name: "營業利益率", state: comparisonState(company.operatingMargin, peer.operatingMargin ?? null, company.operatingMargin !== null && peer.operatingMargin !== null && company.operatingMargin >= peer.operatingMargin), value: percent(company.operatingMargin), benchmark: peer.operatingMargin === null ? null : `同業中位數 ${percent(peer.operatingMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
       { id: "financial-safety", name: "財務安全", state: comparisonState(company.debtRatio, peer.debtRatio ?? null, company.debtRatio !== null && peer.debtRatio !== null && company.debtRatio <= peer.debtRatio), value: company.debtRatio === null ? null : `負債比 ${percent(company.debtRatio)}`, benchmark: peer.debtRatio === null ? null : `同業中位數 ${percent(peer.debtRatio)}`, period: company.period, note: "目前以負債比作初步比較；金融業另行處理", source: "TWSE 資產負債表" },
       { id: "roe-trend", name: "ROE 趨勢", state: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? "unavailable" : fundamental.roeTtm >= fundamental.roeTtmPriorYear ? "pass" : "fail", value: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? null : `${fundamental.roeTtm - fundamental.roeTtmPriorYear >= 0 ? "+" : ""}${(fundamental.roeTtm - fundamental.roeTtmPriorYear).toFixed(2)} 個百分點`, benchmark: fundamental?.roeTtmPriorYear === null || fundamental?.roeTtmPriorYear === undefined ? null : `前一年 TTM ROE ${percent(fundamental.roeTtmPriorYear)}`, period: fundamental?.asOfDate ?? null, note: "最近四季 ROE 與前一年同期間比較", source: "FinMind 損益表、資產負債表" },
+      buildMoatFactor(fundamental, peer.roeTtm),
       { id: "valuation", name: "估值（PE）", state: comparisonState(company.pe, peer.pe ?? null, company.pe !== null && company.pe > 0 && peer.pe !== null && company.pe <= peer.pe), value: multiple(company.pe), benchmark: peer.pe === null ? null : `同業中位數 ${multiple(peer.pe)}`, period: String(company.row.Date ?? ""), note: "正本益比且不高於同業中位數為初步通過", source: "TWSE 本益比、殖利率及股價淨值比" },
       { id: "pb", name: "P/B 合理性", state: comparisonState(company.pb, peer.pb ?? null, company.pb !== null && peer.pb !== null && company.pb <= peer.pb), value: multiple(company.pb), benchmark: peer.pb === null ? null : `同業中位數 ${multiple(peer.pb)}`, period: String(company.row.Date ?? ""), note: "目前以同業中位數比較；歷史分位數待補", source: "TWSE 本益比、殖利率及股價淨值比" },
     ];
@@ -478,6 +570,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
 
   const sources = ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）"];
   if (finMindPerByTicker.size > 0) sources.push("FinMind（PE、P/B、殖利率）");
+  if (Object.keys(fundamentalStore.metrics).length > 0) sources.push("FinMind（公開月營收與財務報表；護城河量化佐證）");
   if (fetchedUsCompanies.length > 0) sources.push("SEC EDGAR company_tickers_exchange.json");
   if (fallbackUsCompanies.length > 0) sources.push("前次市場快照（美股名單備援）");
   const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources, companies: [...twCompanies, ...usCompanies] };

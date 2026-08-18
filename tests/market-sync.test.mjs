@@ -32,7 +32,22 @@ test("尚未建立同步狀態檔時回傳 not_started，而非 running", async 
 test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async () => {
   const worker = await loadWorker();
   const originalFetch = globalThis.fetch;
-  const blobs = new Map();
+  const blobs = new Map([["history/fundamentals/metrics.json", {
+    version: 2,
+    updatedAt: "2026-08-18T00:00:00.000Z",
+    metrics: {
+      2330: {
+        revenueYoY: 12,
+        roeTtm: 20,
+        roeTtmPriorYear: 18,
+        fcfTtm: 100000000,
+        netIncomeTtm: 120000000,
+        positiveNetIncomeQuarters: 4,
+        asOfDate: "2026-06-30",
+        updatedAt: "2026-08-18T00:00:00.000Z",
+      },
+    },
+  }]]);
   let scheduledPromise;
   const twsePayloads = {
     BWIBBU_ALL: [{ Code: "2330", Name: "台積電", Date: "1150814", PEratio: "20", PBratio: "5", DividendYield: "1.2" }],
@@ -82,7 +97,12 @@ test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async
   assert.equal(snapshot.companies.length, 1);
   assert.equal(snapshot.companies[0].ticker, "2330");
   assert.ok(snapshot.companies[0].evaluatedCount > 0);
-  assert.equal(snapshot.companies[0].grade, "B");
+  assert.equal(snapshot.companies[0].grade, "A");
+  const moat = snapshot.companies[0].factors.find((factor) => factor.id === "moat");
+  assert.equal(moat.state, "unavailable");
+  assert.equal(moat.value, "2/2 項量化佐證");
+  assert.deepEqual(moat.evidence.map((item) => item.criterion), ["獲利持續性", "資本效率"]);
+  assert.ok(moat.evidence.every((item) => item.asOfDate === "2026-06-30" && item.confidence === "high" && item.sourceUrl.startsWith("https://")));
   assert.equal(status.status, "success");
   assert.match(status.warnings.join(" "), /FinMind/);
   assert.match(status.warnings.join(" "), /SEC/);
