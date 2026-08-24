@@ -135,6 +135,21 @@ async function getJson<T>(url: string, source: string, headers?: HeadersInit): P
 
 type Sp500Constituent = { ticker: string; name: string; sector: string };
 
+function sp500Company(company: Sp500Constituent): Company {
+  return {
+    ticker: company.ticker,
+    name: company.name,
+    market: "美股",
+    industry: company.sector,
+    currency: "USD",
+    valuation: null,
+    factors: factorNames.map(([id, label]) => unavailable(id, label)),
+    evaluatedCount: 0,
+    passedCount: 0,
+    grade: "資料不足",
+  };
+}
+
 function parseCsvRows(text: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
@@ -402,7 +417,21 @@ export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
     if (response.status === 404) throw new Error("市場快照尚未建立");
     throw new Error(`Azure Blob 讀取失敗：${response.status}${azureError ? ` (${azureError})` : ""}`);
   }
-  return response.json() as Promise<MarketSnapshot>;
+  const snapshot = await response.json() as MarketSnapshot;
+  const usCompanies = snapshot.companies.filter((company) => company.market === "美股");
+  if (usCompanies.length <= 505) return snapshot;
+
+  const taiwanCompanies = snapshot.companies.filter((company) => company.market !== "美股");
+  try {
+    const constituents = await getSp500Constituents();
+    return {
+      ...snapshot,
+      sources: [...snapshot.sources.filter((source) => !source.includes("SEC EDGAR")), "S&P 500 成份股開放資料（datasets/s-and-p-500-companies）"],
+      companies: [...taiwanCompanies, ...constituents.map(sp500Company)],
+    };
+  } catch {
+    return { ...snapshot, sources: snapshot.sources.filter((source) => !source.includes("SEC EDGAR")), companies: taiwanCompanies };
+  }
 }
 
 async function writeSnapshot(env: MarketEnv, snapshot: MarketSnapshot): Promise<void> {
@@ -543,7 +572,6 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
     warnings,
     error: null,
   });
-  if (completedCompanies === tickers.length) await runMarketSync(env);
 }
 
 export async function readSyncStatus(env: MarketEnv): Promise<SyncStatus> {
@@ -684,8 +712,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
   });
 
-  const fetchedUsCompanies: Company[] = sp500Companies
-    .map((company) => ({ ticker: company.ticker, name: company.name, market: "美股", industry: company.sector, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+  const fetchedUsCompanies: Company[] = sp500Companies.map(sp500Company);
   const usCompanies = fetchedUsCompanies.length > 0 ? fetchedUsCompanies : fallbackUsCompanies;
 
   const sources = ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）"];

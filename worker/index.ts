@@ -80,7 +80,13 @@ const worker = {
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (event.cron === "*/10 * * * *") {
-      ctx.waitUntil(runFundamentalBackfill(env));
+      ctx.waitUntil((async () => {
+        try {
+          await runFundamentalBackfill(env);
+        } finally {
+          await runMarketSync(env);
+        }
+      })());
       return;
     }
     ctx.waitUntil(runMarketSync(env));
