@@ -16,6 +16,15 @@ export type MoatEvidence = {
   confidence: EvidenceConfidence;
 };
 
+/** A dated, display-safe observation for one scored factor. */
+export type FactorHistoryPoint = {
+  capturedAt: string;
+  state: FactorState;
+  value: string | null;
+  benchmark: string | null;
+  period: string | null;
+};
+
 export type Factor = {
   id: string;
   name: string;
@@ -26,6 +35,7 @@ export type Factor = {
   note: string;
   source: string;
   evidence?: MoatEvidence[];
+  history?: FactorHistoryPoint[];
 };
 
 export type Valuation = {

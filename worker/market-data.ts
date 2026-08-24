@@ -1,4 +1,4 @@
-import type { Company, Factor, MarketSnapshot, MoatEvidence, Valuation } from "../shared/market";
+import type { Company, Factor, FactorHistoryPoint, MarketSnapshot, MoatEvidence, Valuation } from "../shared/market";
 
 export interface MarketEnv {
   AZURE_STORAGE_ACCOUNT?: string;
@@ -31,6 +31,7 @@ type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 type FinMindFundamentalRow = { date: string; stock_id: string; type?: string; value?: number; revenue?: number; origin_name?: string };
 type FundamentalMetric = {
+  calculationVersion: 3;
   revenueYoY: number | null;
   roeTtm: number | null;
   roeTtmPriorYear: number | null;
@@ -40,14 +41,20 @@ type FundamentalMetric = {
   asOfDate: string | null;
   updatedAt: string;
 };
-type FundamentalStore = { version: 1 | 2; updatedAt: string; metrics: Record<string, FundamentalMetric> };
+type FundamentalStore = { version: 1 | 2 | 3; updatedAt: string; metrics: Record<string, FundamentalMetric> };
+type FactorHistoryStore = {
+  version: 1;
+  updatedAt: string;
+  companies: Record<string, Record<string, FactorHistoryPoint[]>>;
+};
 const twseApi = "https://openapi.twse.com.tw/v1";
-const secTickers = "https://www.sec.gov/files/company_tickers_exchange.json";
+const sp500Constituents = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv";
 const externalRequestTimeoutMs = 12_000;
 const azureRequestTimeoutMs = 10_000;
 const finMindApi = "https://api.finmindtrade.com/api/v4/data";
 const fundamentalStartDate = "2024-01-01";
 const backfillBatchSize = 10;
+const factorHistoryLimit = 48;
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
@@ -126,11 +133,72 @@ async function getJson<T>(url: string, source: string, headers?: HeadersInit): P
   return response.json() as Promise<T>;
 }
 
+type Sp500Constituent = { ticker: string; name: string; sector: string };
+
+function parseCsvRows(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (character === '"' && text[index + 1] === '"') {
+        cell += '"';
+        index += 1;
+      } else if (character === '"') {
+        quoted = false;
+      } else {
+        cell += character;
+      }
+    } else if (character === '"') {
+      quoted = true;
+    } else if (character === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (character === "\n") {
+      row.push(cell.replace(/\r$/, ""));
+      if (row.some((value) => value.length > 0)) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  if (quoted) throw new Error("S&P 500 CSV 格式不完整：引號未結束");
+  row.push(cell.replace(/\r$/, ""));
+  if (row.some((value) => value.length > 0)) rows.push(row);
+  return rows;
+}
+
+async function getSp500Constituents(): Promise<Sp500Constituent[]> {
+  const response = await fetchWithTimeout(sp500Constituents, {}, "S&P 500 成份股名單", externalRequestTimeoutMs);
+  if (!response.ok) throw new Error(`S&P 500 成份股名單請求失敗：${response.status}`);
+  const rows = parseCsvRows(await response.text());
+  const [header, ...dataRows] = rows;
+  const symbolIndex = header?.indexOf("Symbol") ?? -1;
+  const securityIndex = header?.indexOf("Security") ?? -1;
+  const sectorIndex = header?.indexOf("GICS Sector") ?? -1;
+  if (symbolIndex < 0 || securityIndex < 0 || sectorIndex < 0) throw new Error("S&P 500 CSV 欄位不符預期格式");
+  const constituents = dataRows.map((row) => ({
+    ticker: (row[symbolIndex] ?? "").trim(),
+    name: (row[securityIndex] ?? "").trim(),
+    sector: (row[sectorIndex] ?? "").trim(),
+  }));
+  const validTicker = /^[A-Z][A-Z0-9.-]*$/;
+  if (constituents.some((company) => !validTicker.test(company.ticker) || company.name.length === 0 || company.sector.length === 0)) {
+    throw new Error("S&P 500 CSV 包含無效代號、公司名稱或產業欄位");
+  }
+  if (new Set(constituents.map((company) => company.ticker)).size !== constituents.length) throw new Error("S&P 500 CSV 包含重複代號");
+  if (constituents.length < 500 || constituents.length > 505) throw new Error(`S&P 500 成份股筆數異常：${constituents.length}`);
+  return constituents;
+}
+
 async function getFinMindPer(env: MarketEnv, date: string): Promise<Map<string, FinMindPerRow>> {
   if (!env.FINMIND_API_TOKEN) throw new Error("FinMind Token 尚未設定");
   const url = new URL("https://api.finmindtrade.com/api/v4/data");
-  url.search = new URLSearchParams({ dataset: "TaiwanStockPER", start_date: date, end_date: date, token: env.FINMIND_API_TOKEN }).toString();
-  const response = await fetchWithTimeout(url, {}, "FinMind 估值資料", externalRequestTimeoutMs);
+  url.search = new URLSearchParams({ dataset: "TaiwanStockPER", start_date: date, end_date: date }).toString();
+  const response = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${env.FINMIND_API_TOKEN}` } }, "FinMind 估值資料", externalRequestTimeoutMs);
   if (!response.ok) throw new Error(`FinMind 估值資料請求失敗：${response.status}`);
   const payload = await response.json() as { status: number; msg: string; data?: FinMindPerRow[] };
   if (payload.status !== 200 || !payload.data) throw new Error(`FinMind 估值資料不可用：${payload.msg}`);
@@ -176,6 +244,11 @@ function trailingSum(values: Array<{ date: string; value: number }>, endIndex: n
   return values.slice(endIndex - 3, endIndex + 1).reduce((total, item) => total + item.value, 0);
 }
 
+function priorYearPeriod(date: string): string | null {
+  const matched = date.match(/^(\d{4})(-\d{2}-\d{2})$/);
+  return matched ? `${Number(matched[1]) - 1}${matched[2]}` : null;
+}
+
 function calculateFundamentalMetric(
   revenueRows: FinMindFundamentalRow[],
   incomeRows: FinMindFundamentalRow[],
@@ -207,16 +280,21 @@ function calculateFundamentalMetric(
     const netIncomeTtm = trailingSum(income, incomeIndex);
     const cashFlowTtm = trailingSum(operatingCash, cashIndex);
     const capexTtm = trailingSum(capitalExpense, capexIndex);
-    const balanceDates = balanceRows.filter((row) => row.date <= date).map((row) => row.date).sort();
+    // A balance sheet has many rows for every reporting date.  De-duplicate
+    // first; otherwise `length - 5` points to another field from the latest
+    // quarter rather than the equity balance one year earlier.
+    const balanceDates = [...new Set(balanceRows.filter((row) => row.date <= date).map((row) => row.date))].sort();
     const currentEquityDate = balanceDates.at(-1) ?? null;
-    const firstEquityDate = balanceDates.length >= 5 ? balanceDates[balanceDates.length - 5] : null;
-    const currentEquity = currentEquityDate ? metricValue(balanceRows, currentEquityDate, ["TotalEquity", "Equity"]) : null;
-    const firstEquity = firstEquityDate ? metricValue(balanceRows, firstEquityDate, ["TotalEquity", "Equity"]) : null;
+    const firstEquityDate = currentEquityDate ? priorYearPeriod(currentEquityDate) : null;
+    const equityTypes = ["TotalEquity", "Equity", "EquityAttributableToOwnersOfParent"];
+    const currentEquity = currentEquityDate ? metricValue(balanceRows, currentEquityDate, equityTypes) : null;
+    const firstEquity = firstEquityDate ? metricValue(balanceRows, firstEquityDate, equityTypes) : null;
     if (netIncomeTtm !== null && currentEquity !== null && firstEquity !== null && currentEquity + firstEquity !== 0) roeSeries.push({ date, value: netIncomeTtm / ((currentEquity + firstEquity) / 2) * 100 });
     if (cashFlowTtm !== null && capexTtm !== null) fcfSeries.push({ date, value: cashFlowTtm - Math.abs(capexTtm) });
   }
   const latestRoe = roeSeries.at(-1) ?? null;
-  const priorRoe = roeSeries.length >= 5 ? roeSeries[roeSeries.length - 5] : null;
+  const priorRoeDate = latestRoe ? priorYearPeriod(latestRoe.date) : null;
+  const priorRoe = priorRoeDate ? roeSeries.find((item) => item.date === priorRoeDate) ?? null : null;
   const latestFcf = fcfSeries.at(-1) ?? null;
   const latestIncomeIndex = income.length - 1;
   const latestIncomeTtm = trailingSum(income, latestIncomeIndex);
@@ -225,6 +303,7 @@ function calculateFundamentalMetric(
     ? latestIncomeQuarters.filter((item) => item.value > 0).length
     : 0;
   return {
+    calculationVersion: 3,
     revenueYoY,
     roeTtm: latestRoe?.value ?? null,
     roeTtmPriorYear: priorRoe?.value ?? null,
@@ -365,6 +444,44 @@ async function writeFundamentalBackfillStatus(env: MarketEnv, status: Fundamenta
   await writeJsonBlob(env, "status/fundamentals-backfill.json", status);
 }
 
+function calendarDay(isoDate: string): string {
+  return isoDate.slice(0, 10);
+}
+
+function historyPoint(factor: Factor, capturedAt: string): FactorHistoryPoint {
+  return {
+    capturedAt,
+    state: factor.state,
+    value: factor.value,
+    benchmark: factor.benchmark,
+    period: factor.period,
+  };
+}
+
+async function appendFactorHistory(env: MarketEnv, companies: Company[], capturedAt: string): Promise<Company[]> {
+  const store = await readJsonBlob<FactorHistoryStore>(env, "history/factors/taiwan.json")
+    ?? { version: 1, updatedAt: "", companies: {} };
+  const captureDay = calendarDay(capturedAt);
+  const companiesWithHistory = companies.map((company) => {
+    const factorHistory = store.companies[company.ticker] ?? {};
+    store.companies[company.ticker] = factorHistory;
+    const factors = company.factors.map((factor) => {
+      const points = factorHistory[factor.id] ?? [];
+      const point = historyPoint(factor, capturedAt);
+      const lastPoint = points.at(-1);
+      const nextPoints = lastPoint && calendarDay(lastPoint.capturedAt) === captureDay
+        ? [...points.slice(0, -1), point]
+        : [...points, point].slice(-factorHistoryLimit);
+      factorHistory[factor.id] = nextPoints;
+      return { ...factor, history: nextPoints };
+    });
+    return { ...company, factors };
+  });
+  store.updatedAt = capturedAt;
+  await writeJsonBlob(env, "history/factors/taiwan.json", store);
+  return companiesWithHistory;
+}
+
 export async function readFundamentalBackfillStatus(env: MarketEnv): Promise<FundamentalBackfillStatus> {
   return await readJsonBlob<FundamentalBackfillStatus>(env, "status/fundamentals-backfill.json")
     ?? { status: "not_started", startedAt: "", finishedAt: null, completedCompanies: 0, totalCompanies: 0, currentTickers: [], warnings: [], error: null };
@@ -374,12 +491,14 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
   const snapshot = await readSnapshot(env);
   const tickers = snapshot.companies.filter((company) => company.market === "台股").map((company) => company.ticker).sort();
   const existing = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
-    ?? { version: 2, updatedAt: "", metrics: {} };
-  // Version 2 adds the four-quarter profit fields required for conservative
-  // moat evidence. Re-fetch only records which predate that schema.
+    ?? { version: 3, updatedAt: "", metrics: {} };
+  // Version 3 fixes the TTM ROE denominator to use distinct reporting dates
+  // and the same period one year earlier. Re-fetch only records which predate
+  // that calculation so old and new ROE values are never mixed.
   const pending = tickers.filter((ticker) => {
     const metric = existing.metrics[ticker];
     return metric === undefined
+      || metric.calculationVersion !== 3
       || metric.netIncomeTtm === undefined
       || metric.positiveNetIncomeQuarters === undefined;
   });
@@ -404,12 +523,13 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
       warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
     }
   }
-  existing.version = 2;
+  existing.version = 3;
   existing.updatedAt = new Date().toISOString();
   await writeJsonBlob(env, "history/fundamentals/metrics.json", existing);
   const completedCompanies = tickers.filter((ticker) => {
     const metric = existing.metrics[ticker];
     return metric !== undefined
+      && metric.calculationVersion === 3
       && metric.netIncomeTtm !== undefined
       && metric.positiveNetIncomeQuarters !== undefined;
   }).length;
@@ -463,21 +583,22 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     warnings.push("無法辨識 TWSE 資料日期，未取得 FinMind 估值資料。");
   }
 
-  let usTickerData: { data: Array<[string, string, string, string]> } = { data: [] };
+  let sp500Companies: Sp500Constituent[] = [];
   let fallbackUsCompanies: Company[] = [];
   try {
-    usTickerData = await getJson<{ data: Array<[string, string, string, string]> }>(secTickers, "SEC 美股名單", { "User-Agent": "InvestmentCompass contact@bezierline.workers.dev" });
+    sp500Companies = await getSp500Constituents();
   } catch (error) {
     try {
       const existingSnapshot = await readSnapshot(env);
-      fallbackUsCompanies = existingSnapshot.companies.filter((company) => company.market === "美股");
+      const existingUsCompanies = existingSnapshot.companies.filter((company) => company.market === "美股");
+      if (existingUsCompanies.length >= 500 && existingUsCompanies.length <= 505) fallbackUsCompanies = existingUsCompanies;
       if (fallbackUsCompanies.length > 0) {
-        warnings.push(`SEC 美股名單暫時不可用，已保留前次快照的 ${fallbackUsCompanies.length} 檔美股名單（${errorMessage(error).slice(0, 160)}）。`);
+        warnings.push(`S&P 500 成份股名單暫時不可用，已保留前次已驗證的 ${fallbackUsCompanies.length} 檔美股名單（${errorMessage(error).slice(0, 160)}）。`);
       } else {
-        warnings.push(`SEC 美股名單暫時不可用，且前次快照沒有可保留的美股名單（${errorMessage(error).slice(0, 160)}）。`);
+        warnings.push(`S&P 500 成份股名單暫時不可用，且前次快照沒有 500 至 505 檔的已驗證美股名單（${errorMessage(error).slice(0, 160)}）。`);
       }
     } catch (fallbackError) {
-      warnings.push(`SEC 美股名單暫時不可用，且無法讀取前次快照作為備援（${errorMessage(fallbackError).slice(0, 160)}）。`);
+      warnings.push(`S&P 500 成份股名單暫時不可用，且無法讀取前次快照作為備援（來源：${errorMessage(error).slice(0, 120)}；備援：${errorMessage(fallbackError).slice(0, 120)}）。`);
     }
   }
 
@@ -514,7 +635,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     .map((company, index) => ({ ...company, marketCapRank: index + 1 }));
 
   const fundamentalStore = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
-    ?? { version: 1, updatedAt: "", metrics: {} };
+    ?? { version: 3, updatedAt: "", metrics: {} };
 
   const benchmarks = new Map<string, Record<string, number | null>>();
   for (const industry of new Set(topTwCompanies.map((company) => company.industry))) {
@@ -563,17 +684,18 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
   });
 
-  const fetchedUsCompanies: Company[] = usTickerData.data
-    .filter(([, , , exchange]) => ["Nasdaq", "NYSE", "NYSE American"].includes(exchange))
-    .map(([ticker, name, , exchange]) => ({ ticker, name, market: "美股", industry: exchange, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+  const fetchedUsCompanies: Company[] = sp500Companies
+    .map((company) => ({ ticker: company.ticker, name: company.name, market: "美股", industry: company.sector, currency: "USD", valuation: null, factors: factorNames.map(([id, label]) => unavailable(id, label)), evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
   const usCompanies = fetchedUsCompanies.length > 0 ? fetchedUsCompanies : fallbackUsCompanies;
 
   const sources = ["臺灣證券交易所 OpenAPI（收盤價、基本資料與財報）"];
   if (finMindPerByTicker.size > 0) sources.push("FinMind（PE、P/B、殖利率）");
   if (Object.keys(fundamentalStore.metrics).length > 0) sources.push("FinMind（公開月營收與財務報表；護城河量化佐證）");
-  if (fetchedUsCompanies.length > 0) sources.push("SEC EDGAR company_tickers_exchange.json");
-  if (fallbackUsCompanies.length > 0) sources.push("前次市場快照（美股名單備援）");
-  const snapshot: MarketSnapshot = { generatedAt: new Date().toISOString(), sources, companies: [...twCompanies, ...usCompanies] };
+  if (fetchedUsCompanies.length > 0) sources.push("S&P 500 成份股開放資料（datasets/s-and-p-500-companies）");
+  if (fallbackUsCompanies.length > 0) sources.push("前次市場快照（已驗證 S&P 500 名單備援）");
+  const generatedAt = new Date().toISOString();
+  const twCompaniesWithHistory = await appendFactorHistory(env, twCompanies, generatedAt);
+  const snapshot: MarketSnapshot = { generatedAt, sources, companies: [...twCompaniesWithHistory, ...usCompanies] };
   await writeSnapshot(env, snapshot);
   if (warnings.length > 0) {
     await writeSyncStatus(env, { status: "success", startedAt: snapshot.generatedAt, finishedAt: new Date().toISOString(), companyCount: snapshot.companies.length, warnings, error: null });
