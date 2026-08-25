@@ -467,16 +467,23 @@ export async function readSnapshot(env: MarketEnv): Promise<MarketSnapshot> {
   if (usCompanies.length <= 505) return snapshot;
 
   const taiwanCompanies = snapshot.companies.filter((company) => company.market !== "美股");
+  let constituents: Sp500Constituent[];
   try {
-    const constituents = await getSp500Constituents();
-    return {
-      ...snapshot,
-      sources: [...snapshot.sources.filter((source) => !source.includes("SEC EDGAR")), "S&P 500 成份股開放資料（datasets/s-and-p-500-companies）"],
-      companies: [...taiwanCompanies, ...constituents.map(sp500Company)],
-    };
+    constituents = await getSp500Constituents();
   } catch {
     return { ...snapshot, sources: snapshot.sources.filter((source) => !source.includes("SEC EDGAR")), companies: taiwanCompanies };
   }
+  const migratedSnapshot: MarketSnapshot = {
+    ...snapshot,
+    sources: [...new Set([...snapshot.sources.filter((source) => !source.includes("SEC EDGAR")), "S&P 500 成份股開放資料（datasets/s-and-p-500-companies）"])],
+    companies: [...taiwanCompanies, ...constituents.map(sp500Company)],
+  };
+  const usCount = migratedSnapshot.companies.filter((company) => company.market === "美股").length;
+  if (taiwanCompanies.length !== 200 || usCount < 500 || usCount > 505) throw new Error("市場快照遷移驗證失敗");
+  const backupName = `archive/current-market-before-sp500-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  await writeJsonBlob(env, backupName, snapshot);
+  await writeSnapshot(env, migratedSnapshot);
+  return migratedSnapshot;
 }
 
 async function writeSnapshot(env: MarketEnv, snapshot: MarketSnapshot): Promise<void> {

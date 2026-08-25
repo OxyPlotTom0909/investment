@@ -322,6 +322,37 @@ test("S&P 500 成份股來源筆數異常時不會混入舊的全美股清單", 
   assert.match(status.warnings.join(" "), /筆數異常：499/);
 });
 
+test("讀取舊全美股快照時會先備份，再原子遷移成台股 200 檔與 S&P 500", async () => {
+  const worker = await loadWorker();
+  const originalFetch = globalThis.fetch;
+  const taiwan = Array.from({ length: 200 }, (_, index) => ({ ticker: `${1000 + index}`, name: `台股 ${index}`, market: "台股", industry: "測試", currency: "TWD", factors: [], evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+  const legacyUs = Array.from({ length: 6000 }, (_, index) => ({ ticker: `US${index}`, name: `Legacy US ${index}`, market: "美股", industry: "Legacy", currency: "USD", factors: [], evaluatedCount: 0, passedCount: 0, grade: "資料不足" }));
+  const blobs = new Map([["current/market.json", { generatedAt: "2026-08-01T00:00:00.000Z", sources: ["SEC EDGAR"], companies: [...taiwan, ...legacyUs] }]]);
+  const csvRows = ["Symbol,Security,GICS Sector"];
+  for (let index = 0; index < 500; index += 1) csvRows.push(`SP${String(index).padStart(3, "0")},S&P Company ${index},Industrials`);
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.hostname === "raw.githubusercontent.com") return new Response(csvRows.join("\n"));
+    if (url.hostname === "testaccount.blob.core.windows.net") {
+      const key = url.pathname.replace("/market-data/", "");
+      if ((init.method ?? "GET") === "PUT") { blobs.set(key, JSON.parse(String(init.body))); return new Response(null, { status: 201 }); }
+      const body = blobs.get(key);
+      return body ? Response.json(body) : new Response(null, { status: 404 });
+    }
+    throw new Error(`Unexpected test request: ${url.hostname}`);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/market"), { AZURE_STORAGE_ACCOUNT: "testaccount", AZURE_STORAGE_CONTAINER: "market-data", AZURE_STORAGE_SAS: "sv=test&sig=not-a-secret" }, { waitUntil() {}, passThroughOnException() {} });
+    const snapshot = await response.json();
+    assert.equal(snapshot.companies.length, 700);
+    assert.equal(snapshot.companies.filter((company) => company.market === "美股").length, 500);
+    assert.equal(blobs.get("current/market.json").companies.length, 700);
+    assert.ok([...blobs.keys()].some((key) => key.startsWith("archive/current-market-before-sp500-")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("TWSE 請求逾時會結束同步並記錄可診斷失敗狀態", { timeout: 15_000 }, async () => {
   const worker = await loadWorker();
   const originalFetch = globalThis.fetch;
