@@ -41,6 +41,7 @@ h1 { font-family: Georgia, "Noto Serif TC", serif; font-size: clamp(2.3rem, 5vw,
 .no-passed-factor { background: #eef0eb; color: var(--muted); }
 .company-search { position: relative; min-width: 220px; }
 .company-search input { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--ink); font-size: .92rem; }
+.controls select, .company-search input { min-height: 42px; }
 .company-search ul { position: absolute; z-index: 3; top: calc(100% + 5px); left: 0; right: 0; max-height: 280px; margin: 0; padding: 5px; overflow-y: auto; list-style: none; border: 1px solid var(--line); border-radius: 10px; background: var(--card); box-shadow: 0 12px 28px #14362922; }
 .company-search li + li { border-top: 1px solid var(--line); }
 .company-search li button { display: grid; width: 100%; gap: 2px; padding: 10px; border: 0; border-radius: 7px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
