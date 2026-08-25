@@ -30,7 +30,7 @@ function numericValue(value: string | null): number | null {
 function trendPoints(factor: Factor): TrendPoint[] {
   return (factor.history ?? []).flatMap((point) => {
     const value = numericValue(point.value);
-    return value === null ? [] : [{ label: new Date(point.capturedAt).toLocaleDateString("zh-TW"), value, display: point.value ?? "資料待補" }];
+    return value === null ? [] : [{ label: point.period ?? new Date(point.capturedAt).toLocaleDateString("zh-TW"), value, display: point.value ?? "資料待補" }];
   });
 }
 
@@ -65,7 +65,17 @@ function FactorCard({ factor }: { factor: Factor }) {
 }
 
 function CompanyRow({ company, onSelect }: { company: Company; onSelect: (company: Company) => void }) {
-  return <button className="company-row" onClick={() => onSelect(company)}><span className={`grade ${gradeClass(company.grade)}`}>{company.grade === "資料不足" ? "…" : company.grade}</span><span className="company-name"><strong>{company.name}</strong><small>{company.ticker} · {company.market} · {company.industry}</small></span><span className="pass-count">{company.passedCount}<small>/ {company.evaluatedCount} 已評</small></span></button>;
+  const passedFactors = company.factors.filter((factor) => factor.state === "pass");
+  return <button className="company-row" onClick={() => onSelect(company)}>
+    <span className="company-row-top">
+      <span className={`grade ${gradeClass(company.grade)}`}>{company.grade === "資料不足" ? "…" : company.grade}</span>
+      <span className="company-name"><strong>{company.name}</strong><small>{company.ticker} · {company.market} · {company.industry}</small></span>
+      <span className="pass-count">{company.passedCount}<small>/ {company.evaluatedCount} 已評</small></span>
+    </span>
+    <span className="company-row-bottom">
+      {passedFactors.length ? passedFactors.map((factor) => <span className="passed-factor" key={factor.id}>{factor.name}</span>) : <span className="no-passed-factor">目前無合格評比</span>}
+    </span>
+  </button>;
 }
 
 export default function Home() {
@@ -73,24 +83,34 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [market, setMarket] = useState<MarketFilter>("全部");
   const [grade, setGrade] = useState<GradeFilter>("全部");
+  const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [view, setView] = useState<"list" | "detail">("list");
 
   useEffect(() => { void fetch("/api/market").then(async (response) => { if (!response.ok) { const body = await response.json() as { error?: string }; throw new Error(body.error ?? "市場資料讀取失敗"); } return response.json() as Promise<MarketSnapshot>; }).then((data) => { setSnapshot(data); setSelectedKey(null); setView("list"); }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "市場資料讀取失敗")); }, []);
 
-  const filteredCompanies = useMemo(() => filterCompanies(snapshot?.companies ?? [], market, grade) as Company[], [snapshot, market, grade]);
+  const marketCompanies = useMemo(() => (snapshot?.companies ?? []).filter((company) => market === "全部" || company.market === market), [snapshot, market]);
+  const searchSuggestions = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    if (!normalized) return [];
+    return marketCompanies.filter((company) => `${company.name} ${company.ticker}`.toLocaleLowerCase().includes(normalized)).slice(0, 8);
+  }, [marketCompanies, query]);
+  const filteredCompanies = useMemo(() => filterCompanies(marketCompanies, "全部", grade).filter((company) => {
+    const normalized = query.trim().toLocaleLowerCase();
+    return !normalized || `${company.name} ${company.ticker}`.toLocaleLowerCase().includes(normalized);
+  }) as Company[], [marketCompanies, grade, query]);
   const hasActiveFilter = market !== "全部" || grade !== "全部";
   const companies = useMemo(() => companiesForDisplay(filteredCompanies, hasActiveFilter) as Company[], [filteredCompanies, hasActiveFilter]);
   const qualifiedCompanies = useMemo(() => companies.filter((company) => company.grade === "A" || company.grade === "B"), [companies]);
   const gradeCounts = useMemo(() => { const inMarket = (snapshot?.companies ?? []).filter((company) => market === "全部" || company.market === market); return new Map<GradeFilter, number>([["全部", inMarket.length], ["A", inMarket.filter((company) => company.grade === "A").length], ["B", inMarket.filter((company) => company.grade === "B").length], ["C", inMarket.filter((company) => company.grade === "C").length], ["資料不足", inMarket.filter((company) => company.grade === "資料不足").length]]); }, [snapshot, market]);
   const selected = selectedCompany(snapshot?.companies ?? [], selectedKey) as Company | null;
   const isUnratedUsSelection = market === "美股" && grade !== "全部" && grade !== "資料不足" && companies.length === 0;
-  const selectCompany = (company: Company): void => { setSelectedKey(companyKey(company)); setView("detail"); };
+  const selectCompany = (company: Company): void => { setSelectedKey(companyKey(company)); setQuery(""); setView("detail"); };
   const showList = (): void => { setSelectedKey(null); setView("list"); };
 
   return <main>
     <section className="hero"><h1>台股與美股風險評估</h1><div className="hero-notes"><span>不構成投資建議</span><span>{snapshot ? `資料快照：${new Date(snapshot.generatedAt).toLocaleString("zh-TW")}` : "正在讀取市場快照"}</span></div></section>
-    <section className="controls" aria-label="篩選條件"><div><label htmlFor="market">市場</label><select id="market" value={market} onChange={(event) => setMarket(event.target.value as MarketFilter)}><option>全部</option><option>台股</option><option>美股</option></select></div><div><label htmlFor="grade">品質級別</label><select id="grade" value={grade} onChange={(event) => setGrade(event.target.value as GradeFilter)}><option value="全部">全部（{gradeCounts.get("全部") ?? 0}）</option><option value="A">A（{gradeCounts.get("A") ?? 0}）</option><option value="B">B（{gradeCounts.get("B") ?? 0}）</option><option value="C">C（{gradeCounts.get("C") ?? 0}）</option><option value="資料不足">資料不足（{gradeCounts.get("資料不足") ?? 0}）</option></select></div><aside className="rule-card"><strong>分級規則</strong><span>A ≥ 8、B 5–7、C ≤ 4；未具可評資料則標示資料不足</span></aside></section>
+    <section className="controls" aria-label="篩選條件"><div><label htmlFor="market">市場</label><select id="market" value={market} onChange={(event) => setMarket(event.target.value as MarketFilter)}><option>全部</option><option>台股</option><option>美股</option></select></div><div><label htmlFor="grade">品質級別</label><select id="grade" value={grade} onChange={(event) => setGrade(event.target.value as GradeFilter)}><option value="全部">全部（{gradeCounts.get("全部") ?? 0}）</option><option value="A">A（{gradeCounts.get("A") ?? 0}）</option><option value="B">B（{gradeCounts.get("B") ?? 0}）</option><option value="C">C（{gradeCounts.get("C") ?? 0}）</option><option value="資料不足">資料不足（{gradeCounts.get("資料不足") ?? 0}）</option></select></div><div className="company-search"><label htmlFor="company-search">搜尋公司</label><input id="company-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="名稱或代號" autoComplete="off" />{searchSuggestions.length ? <ul role="listbox" aria-label="公司搜尋建議">{searchSuggestions.map((company) => <li key={companyKey(company)}><button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => selectCompany(company)}><strong>{company.name}</strong><span>{company.ticker} · {company.market}</span></button></li>)}</ul> : null}{query.trim() && !searchSuggestions.length ? <small>找不到符合的公司</small> : null}</div><aside className="rule-card"><strong>分級規則</strong><span>A ≥ 8、B 5–7、C ≤ 4；未具可評資料則標示資料不足</span></aside></section>
     <section className="moat-standard" aria-label="護城河評分標準"><div><span className="eyebrow">護城河評估標準</span><h2>以 5 項可追溯證據評分</h2><p>每項證據均需保留來源、資料日期與信心等級；確認 4–5 項為強、2–3 項為中、0–1 項為弱，少於 3 項可驗證來源則維持資料不足。</p></div><ol><li><strong>獲利持續性</strong><span>近 3 年至少 2 年營業利益率不低於同業中位數。</span></li><li><strong>競爭地位</strong><span>市占前 3 名或具可查證的領先地位。</span></li><li><strong>轉換成本</strong><span>續約／留存率、長約或認證機制具公開佐證。</span></li><li><strong>無形資產</strong><span>有效專利、商標、牌照或關鍵認證具公開紀錄。</span></li><li><strong>資本效率</strong><span>近 3 年 ROE／ROIC 持續不低於同業中位數。</span></li></ol></section>
     {error ? <section className="status-card"><strong>市場快照尚未就緒</strong><p>{error}。請確認 Azure SAS 具備讀取、建立與寫入權限。</p></section> : null}{!snapshot && !error ? <section className="status-card">資料讀取中</section> : null}
     {snapshot && view === "list" ? <section className="company-overview" aria-label="全部公司清單"><div className="overview-top list-card"><div className="section-heading"><span className="eyebrow">{hasActiveFilter ? `符合條件的公司（${companies.length} 家）` : `全部公司（${companies.length} 家）`}</span></div>{companies.length === 0 ? <p className="empty-state">{isUnratedUsSelection ? "美股尚未完成品質評分，因此目前沒有 A／B／C 級結果；可選擇「資料不足」查看已收錄名單。" : "沒有符合目前篩選條件的公司。"}</p> : <div className="company-list">{companies.map((company) => <CompanyRow company={company} key={companyKey(company)} onSelect={selectCompany} />)}</div>}</div><div className="overview-bottom"><div className="section-heading"><div><span className="eyebrow">已評合格</span><h2>A、B 級公司</h2></div><span className="qualified-count">{qualifiedCompanies.length} 家</span></div>{qualifiedCompanies.length === 0 ? <p className="empty-state">目前篩選條件下沒有 A 或 B 級公司。</p> : <div className="qualified-grid">{qualifiedCompanies.map((company) => <button className="qualified-card" key={companyKey(company)} onClick={() => selectCompany(company)}><span className={`grade ${gradeClass(company.grade)}`}>{company.grade}</span><div><strong>{company.name}</strong><small>{company.ticker} · {company.market}</small><span>{company.passedCount} / {company.evaluatedCount} 項符合</span></div></button>)}</div>}</div></section> : null}

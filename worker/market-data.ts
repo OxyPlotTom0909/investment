@@ -31,7 +31,7 @@ type RecordData = Record<string, string | number | null | undefined>;
 type FinMindPerRow = { stock_id: string; PER: number | null; PBR: number | null; dividend_yield: number | null };
 type FinMindFundamentalRow = { date: string; stock_id: string; type?: string; value?: number; revenue?: number; origin_name?: string };
 type FundamentalMetric = {
-  calculationVersion: 3;
+  calculationVersion: 4;
   revenueYoY: number | null;
   roeTtm: number | null;
   roeTtmPriorYear: number | null;
@@ -39,9 +39,17 @@ type FundamentalMetric = {
   netIncomeTtm: number | null;
   positiveNetIncomeQuarters: number;
   asOfDate: string | null;
+  history: FundamentalHistoryPoint[];
   updatedAt: string;
 };
-type FundamentalStore = { version: 1 | 2 | 3; updatedAt: string; metrics: Record<string, FundamentalMetric> };
+type FundamentalHistoryPoint = {
+  period: string;
+  revenueYoY: number | null;
+  roeTtm: number | null;
+  roeTtmPriorYear: number | null;
+  fcfTtm: number | null;
+};
+type FundamentalStore = { version: 1 | 2 | 3 | 4; updatedAt: string; metrics: Record<string, FundamentalMetric> };
 type FactorHistoryStore = {
   version: 1;
   updatedAt: string;
@@ -52,7 +60,7 @@ const sp500Constituents = "https://raw.githubusercontent.com/datasets/s-and-p-50
 const externalRequestTimeoutMs = 12_000;
 const azureRequestTimeoutMs = 10_000;
 const finMindApi = "https://api.finmindtrade.com/api/v4/data";
-const fundamentalStartDate = "2024-01-01";
+const fundamentalStartDate = "2023-01-01";
 const backfillBatchSize = 10;
 const factorHistoryLimit = 48;
 const factorNames = [
@@ -317,8 +325,32 @@ function calculateFundamentalMetric(
   const positiveNetIncomeQuarters = latestIncomeQuarters.length === 4
     ? latestIncomeQuarters.filter((item) => item.value > 0).length
     : 0;
+  const historyByPeriod = new Map<string, FundamentalHistoryPoint>();
+  const historyEntry = (period: string): FundamentalHistoryPoint => {
+    const existing = historyByPeriod.get(period);
+    if (existing) return existing;
+    const created: FundamentalHistoryPoint = { period, revenueYoY: null, roeTtm: null, roeTtmPriorYear: null, fcfTtm: null };
+    historyByPeriod.set(period, created);
+    return created;
+  };
+  for (const month of [...revenueByMonth.keys()].sort()) {
+    if (month < "2024-01") continue;
+    const previousMonth = `${Number(month.slice(0, 4)) - 1}${month.slice(4)}`;
+    const current = revenueByMonth.get(month) ?? null;
+    const previous = revenueByMonth.get(previousMonth) ?? null;
+    historyEntry(`${month}-01`).revenueYoY = current !== null && previous !== null && previous !== 0
+      ? (current - previous) / Math.abs(previous) * 100
+      : null;
+  }
+  for (const point of roeSeries) {
+    if (point.date < "2024-01-01") continue;
+    const entry = historyEntry(point.date);
+    entry.roeTtm = point.value;
+    entry.roeTtmPriorYear = roeSeries.find((candidate) => candidate.date === priorYearPeriod(point.date))?.value ?? null;
+  }
+  for (const point of fcfSeries) if (point.date >= "2024-01-01") historyEntry(point.date).fcfTtm = point.value;
   return {
-    calculationVersion: 3,
+    calculationVersion: 4,
     revenueYoY,
     roeTtm: latestRoe?.value ?? null,
     roeTtmPriorYear: priorRoe?.value ?? null,
@@ -326,6 +358,7 @@ function calculateFundamentalMetric(
     netIncomeTtm: latestIncomeTtm,
     positiveNetIncomeQuarters,
     asOfDate: latestRoe?.date ?? latestFcf?.date ?? income.at(-1)?.date ?? latestMonth,
+    history: [...historyByPeriod.values()].sort((left, right) => left.period.localeCompare(right.period)),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -382,6 +415,18 @@ function buildMoatFactor(
     source: evidenceCount === 0 ? "待補：公開年報、法說會、專利／商標與產業市占資料" : "FinMind 公開財報資料（詳見佐證）",
     evidence,
   };
+}
+
+function fundamentalFactorHistory(fundamental: FundamentalMetric | undefined, factorId: "revenue-growth" | "roe" | "fcf" | "roe-trend"): FactorHistoryPoint[] {
+  if (!fundamental) return [];
+  return (fundamental.history ?? []).flatMap((point) => {
+    const value = factorId === "revenue-growth" ? percent(point.revenueYoY)
+      : factorId === "roe" ? percent(point.roeTtm)
+        : factorId === "fcf" ? point.fcfTtm === null ? null : `${(point.fcfTtm / 100_000_000).toFixed(0)} 億元`
+          : point.roeTtm === null || point.roeTtmPriorYear === null ? null : `${point.roeTtm - point.roeTtmPriorYear >= 0 ? "+" : ""}${(point.roeTtm - point.roeTtmPriorYear).toFixed(2)} 個百分點`;
+    if (value === null) return [];
+    return [{ capturedAt: fundamental.updatedAt, state: "unavailable", value, benchmark: null, period: point.period }];
+  });
 }
 
 function gregorianDate(rocDate: unknown): string | null {
@@ -520,14 +565,13 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
   const snapshot = await readSnapshot(env);
   const tickers = snapshot.companies.filter((company) => company.market === "台股").map((company) => company.ticker).sort();
   const existing = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
-    ?? { version: 3, updatedAt: "", metrics: {} };
-  // Version 3 fixes the TTM ROE denominator to use distinct reporting dates
-  // and the same period one year earlier. Re-fetch only records which predate
-  // that calculation so old and new ROE values are never mixed.
+    ?? { version: 4, updatedAt: "", metrics: {} };
+  // Version 4 retains the 2024-onward financial history used by detail charts.
+  // Re-fetch prior versions so snapshots never mix latest-only and historical metrics.
   const pending = tickers.filter((ticker) => {
     const metric = existing.metrics[ticker];
     return metric === undefined
-      || metric.calculationVersion !== 3
+      || metric.calculationVersion !== 4
       || metric.netIncomeTtm === undefined
       || metric.positiveNetIncomeQuarters === undefined;
   });
@@ -552,13 +596,13 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
       warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
     }
   }
-  existing.version = 3;
+  existing.version = 4;
   existing.updatedAt = new Date().toISOString();
   await writeJsonBlob(env, "history/fundamentals/metrics.json", existing);
   const completedCompanies = tickers.filter((ticker) => {
     const metric = existing.metrics[ticker];
     return metric !== undefined
-      && metric.calculationVersion === 3
+      && metric.calculationVersion === 4
       && metric.netIncomeTtm !== undefined
       && metric.positiveNetIncomeQuarters !== undefined;
   }).length;
@@ -663,7 +707,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     .map((company, index) => ({ ...company, marketCapRank: index + 1 }));
 
   const fundamentalStore = await readJsonBlob<FundamentalStore>(env, "history/fundamentals/metrics.json")
-    ?? { version: 3, updatedAt: "", metrics: {} };
+    ?? { version: 4, updatedAt: "", metrics: {} };
 
   const benchmarks = new Map<string, Record<string, number | null>>();
   for (const industry of new Set(topTwCompanies.map((company) => company.industry))) {
@@ -694,14 +738,14 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
       dividendYield: company.dividendYield,
     };
     const measured: Factor[] = [
-      { id: "revenue-growth", name: "營收成長率", state: comparisonState(fundamental?.revenueYoY ?? null, peer.revenueYoY ?? null, fundamental?.revenueYoY !== undefined && peer.revenueYoY !== undefined && fundamental.revenueYoY >= peer.revenueYoY), value: percent(fundamental?.revenueYoY ?? null), benchmark: peer.revenueYoY === null || peer.revenueYoY === undefined ? null : `同業中位數 ${percent(peer.revenueYoY)}`, period: fundamental?.asOfDate ?? null, note: "最新單月營收相較去年同月", source: "FinMind 月營收表" },
+      { id: "revenue-growth", name: "營收成長率", state: comparisonState(fundamental?.revenueYoY ?? null, peer.revenueYoY ?? null, fundamental?.revenueYoY !== undefined && peer.revenueYoY !== undefined && fundamental.revenueYoY >= peer.revenueYoY), value: percent(fundamental?.revenueYoY ?? null), benchmark: peer.revenueYoY === null || peer.revenueYoY === undefined ? null : `同業中位數 ${percent(peer.revenueYoY)}`, period: fundamental?.asOfDate ?? null, note: "最新單月營收相較去年同月", source: "FinMind 月營收表", history: fundamentalFactorHistory(fundamental, "revenue-growth") },
       { id: "eps-growth", name: "EPS 成長", state: company.eps === null ? "unavailable" : company.eps > 0 ? "pass" : "fail", value: company.eps === null ? null : `${company.eps.toFixed(2)} 元`, benchmark: null, period: company.period, note: "目前季累計 EPS；成長趨勢需待歷史資料補齊", source: "TWSE 綜合損益表" },
-      { id: "roe", name: "ROE", state: comparisonState(fundamental?.roeTtm ?? null, peer.roeTtm ?? null, fundamental?.roeTtm !== undefined && peer.roeTtm !== undefined && fundamental.roeTtm >= peer.roeTtm), value: percent(fundamental?.roeTtm ?? null), benchmark: peer.roeTtm === null || peer.roeTtm === undefined ? null : `同業中位數 ${percent(peer.roeTtm)}`, period: fundamental?.asOfDate ?? null, note: "最近四季稅後淨利 ÷ 平均股東權益", source: "FinMind 損益表、資產負債表" },
-      { id: "fcf", name: "自由現金流", state: comparisonState(fundamental?.fcfTtm ?? null, peer.fcfTtm ?? null, fundamental?.fcfTtm !== undefined && peer.fcfTtm !== undefined && fundamental.fcfTtm >= peer.fcfTtm), value: fundamental?.fcfTtm === null || fundamental?.fcfTtm === undefined ? null : `${(fundamental.fcfTtm / 100_000_000).toFixed(0)} 億元`, benchmark: peer.fcfTtm === null || peer.fcfTtm === undefined ? null : `同業中位數 ${(peer.fcfTtm / 100_000_000).toFixed(0)} 億元`, period: fundamental?.asOfDate ?? null, note: "最近四季營業現金流減資本支出", source: "FinMind 現金流量表" },
+      { id: "roe", name: "ROE", state: comparisonState(fundamental?.roeTtm ?? null, peer.roeTtm ?? null, fundamental?.roeTtm !== undefined && peer.roeTtm !== undefined && fundamental.roeTtm >= peer.roeTtm), value: percent(fundamental?.roeTtm ?? null), benchmark: peer.roeTtm === null || peer.roeTtm === undefined ? null : `同業中位數 ${percent(peer.roeTtm)}`, period: fundamental?.asOfDate ?? null, note: "最近四季稅後淨利 ÷ 平均股東權益", source: "FinMind 損益表、資產負債表", history: fundamentalFactorHistory(fundamental, "roe") },
+      { id: "fcf", name: "自由現金流", state: comparisonState(fundamental?.fcfTtm ?? null, peer.fcfTtm ?? null, fundamental?.fcfTtm !== undefined && peer.fcfTtm !== undefined && fundamental.fcfTtm >= peer.fcfTtm), value: fundamental?.fcfTtm === null || fundamental?.fcfTtm === undefined ? null : `${(fundamental.fcfTtm / 100_000_000).toFixed(0)} 億元`, benchmark: peer.fcfTtm === null || peer.fcfTtm === undefined ? null : `同業中位數 ${(peer.fcfTtm / 100_000_000).toFixed(0)} 億元`, period: fundamental?.asOfDate ?? null, note: "最近四季營業現金流減資本支出", source: "FinMind 現金流量表", history: fundamentalFactorHistory(fundamental, "fcf") },
       { id: "gross-margin", name: "毛利率", state: comparisonState(company.grossMargin, peer.grossMargin ?? null, company.grossMargin !== null && peer.grossMargin !== null && company.grossMargin >= peer.grossMargin), value: percent(company.grossMargin), benchmark: peer.grossMargin === null ? null : `同業中位數 ${percent(peer.grossMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
       { id: "operating-margin", name: "營業利益率", state: comparisonState(company.operatingMargin, peer.operatingMargin ?? null, company.operatingMargin !== null && peer.operatingMargin !== null && company.operatingMargin >= peer.operatingMargin), value: percent(company.operatingMargin), benchmark: peer.operatingMargin === null ? null : `同業中位數 ${percent(peer.operatingMargin)}`, period: company.period, note: "與同產業上市公司中位數比較", source: "TWSE 綜合損益表" },
       { id: "financial-safety", name: "財務安全", state: comparisonState(company.debtRatio, peer.debtRatio ?? null, company.debtRatio !== null && peer.debtRatio !== null && company.debtRatio <= peer.debtRatio), value: company.debtRatio === null ? null : `負債比 ${percent(company.debtRatio)}`, benchmark: peer.debtRatio === null ? null : `同業中位數 ${percent(peer.debtRatio)}`, period: company.period, note: "目前以負債比作初步比較；金融業另行處理", source: "TWSE 資產負債表" },
-      { id: "roe-trend", name: "ROE 趨勢", state: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? "unavailable" : fundamental.roeTtm >= fundamental.roeTtmPriorYear ? "pass" : "fail", value: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? null : `${fundamental.roeTtm - fundamental.roeTtmPriorYear >= 0 ? "+" : ""}${(fundamental.roeTtm - fundamental.roeTtmPriorYear).toFixed(2)} 個百分點`, benchmark: fundamental?.roeTtmPriorYear === null || fundamental?.roeTtmPriorYear === undefined ? null : `前一年 TTM ROE ${percent(fundamental.roeTtmPriorYear)}`, period: fundamental?.asOfDate ?? null, note: "最近四季 ROE 與前一年同期間比較", source: "FinMind 損益表、資產負債表" },
+      { id: "roe-trend", name: "ROE 趨勢", state: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? "unavailable" : fundamental.roeTtm >= fundamental.roeTtmPriorYear ? "pass" : "fail", value: fundamental?.roeTtm === null || fundamental?.roeTtm === undefined || fundamental.roeTtmPriorYear === null || fundamental.roeTtmPriorYear === undefined ? null : `${fundamental.roeTtm - fundamental.roeTtmPriorYear >= 0 ? "+" : ""}${(fundamental.roeTtm - fundamental.roeTtmPriorYear).toFixed(2)} 個百分點`, benchmark: fundamental?.roeTtmPriorYear === null || fundamental?.roeTtmPriorYear === undefined ? null : `前一年 TTM ROE ${percent(fundamental.roeTtmPriorYear)}`, period: fundamental?.asOfDate ?? null, note: "最近四季 ROE 與前一年同期間比較", source: "FinMind 損益表、資產負債表", history: fundamentalFactorHistory(fundamental, "roe-trend") },
       buildMoatFactor(fundamental, peer.roeTtm),
       { id: "valuation", name: "估值（PE）", state: comparisonState(company.pe, peer.pe ?? null, company.pe !== null && company.pe > 0 && peer.pe !== null && company.pe <= peer.pe), value: multiple(company.pe), benchmark: peer.pe === null ? null : `同業中位數 ${multiple(peer.pe)}`, period: String(company.row.Date ?? ""), note: "正本益比且不高於同業中位數為初步通過", source: "TWSE 本益比、殖利率及股價淨值比" },
       { id: "pb", name: "P/B 合理性", state: comparisonState(company.pb, peer.pb ?? null, company.pb !== null && peer.pb !== null && company.pb <= peer.pb), value: multiple(company.pb), benchmark: peer.pb === null ? null : `同業中位數 ${multiple(peer.pb)}`, period: String(company.row.Date ?? ""), note: "目前以同業中位數比較；歷史分位數待補", source: "TWSE 本益比、殖利率及股價淨值比" },

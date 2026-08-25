@@ -33,3 +33,17 @@ h1 { font-family: Georgia, "Noto Serif TC", serif; font-size: clamp(2.3rem, 5vw,
 .trend-chart .chart-empty { fill: var(--muted); font-size: 12px; }
 .trend-chart figcaption { margin-top: 4px; color: var(--muted); font-size: .74rem; text-align: right; }
 @media (max-width: 780px) { .record-card { padding: 13px; }.record-card dl { grid-template-columns: 1fr; }.trend-chart { padding: 6px; }.trend-chart svg { min-height: 112px; } }
+.company-row { display: grid; gap: 10px; padding: 14px 7px; }
+.company-row-top { display: flex; align-items: center; gap: 12px; width: 100%; }
+.company-row-bottom { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 40px; }
+.passed-factor, .no-passed-factor { border-radius: 99px; padding: 4px 8px; font-size: .72rem; line-height: 1.2; }
+.passed-factor { background: #dff1da; color: #14523e; font-weight: 700; }
+.no-passed-factor { background: #eef0eb; color: var(--muted); }
+.company-search { position: relative; min-width: 220px; }
+.company-search input { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--ink); font-size: .92rem; }
+.company-search ul { position: absolute; z-index: 3; top: calc(100% + 5px); left: 0; right: 0; max-height: 280px; margin: 0; padding: 5px; overflow-y: auto; list-style: none; border: 1px solid var(--line); border-radius: 10px; background: var(--card); box-shadow: 0 12px 28px #14362922; }
+.company-search li + li { border-top: 1px solid var(--line); }
+.company-search li button { display: grid; width: 100%; gap: 2px; padding: 10px; border: 0; border-radius: 7px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.company-search li button:hover, .company-search li button:focus-visible { background: #edf5e7; outline: 0; }
+.company-search li span, .company-search small { color: var(--muted); font-size: .75rem; }
+@media (max-width: 780px) { .controls > div, .company-search { width: 100%; }.company-row-bottom { padding-left: 0; }.company-search ul { position: relative; max-height: 220px; margin-top: 5px; } }

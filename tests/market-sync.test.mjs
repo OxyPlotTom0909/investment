@@ -174,8 +174,9 @@ test("ROE 以去年同期的平均權益計算，並略過同季重複欄位日�
     globalThis.fetch = originalFetch;
   }
   const metric = blobs.get("history/fundamentals/metrics.json").metrics[2330];
-  assert.equal(metric.calculationVersion, 3);
+  assert.equal(metric.calculationVersion, 4);
   assert.equal(metric.roeTtm, 65 / 150 * 100);
+  assert.ok(metric.history.some((point) => point.period === "2026-06-30" && point.roeTtm === 65 / 150 * 100));
 });
 
 test("S&P 500 成份股來源只保留已驗證的 S&P 500 名單，且失敗時使用前次已驗證名單", async () => {
