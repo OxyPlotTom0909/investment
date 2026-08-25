@@ -606,13 +606,20 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
       && metric.netIncomeTtm !== undefined
       && metric.positiveNetIncomeQuarters !== undefined;
   }).length;
+  const remainingTickers = tickers.filter((ticker) => {
+    const metric = existing.metrics[ticker];
+    return metric === undefined
+      || metric.calculationVersion !== 4
+      || metric.netIncomeTtm === undefined
+      || metric.positiveNetIncomeQuarters === undefined;
+  });
   await writeFundamentalBackfillStatus(env, {
     status: completedCompanies === tickers.length ? "success" : "running",
     startedAt,
     finishedAt: completedCompanies === tickers.length ? new Date().toISOString() : null,
     completedCompanies,
     totalCompanies: tickers.length,
-    currentTickers: completedCompanies === tickers.length ? [] : tickers.filter((ticker) => existing.metrics[ticker] === undefined).slice(0, backfillBatchSize),
+    currentTickers: completedCompanies === tickers.length ? [] : remainingTickers.slice(0, backfillBatchSize),
     warnings,
     error: null,
   });
