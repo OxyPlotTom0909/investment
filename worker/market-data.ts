@@ -62,6 +62,7 @@ const azureRequestTimeoutMs = 10_000;
 const finMindApi = "https://api.finmindtrade.com/api/v4/data";
 const fundamentalStartDate = "2023-01-01";
 const backfillBatchSize = 10;
+const backfillConcurrency = 2;
 const factorHistoryLimit = 48;
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
@@ -590,18 +591,20 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
   const startedAt = new Date().toISOString();
   await writeFundamentalBackfillStatus(env, { status: "running", startedAt, finishedAt: null, completedCompanies: tickers.length - pending.length, totalCompanies: tickers.length, currentTickers: batch, warnings: [], error: null });
   const warnings: string[] = [];
-  for (const ticker of batch) {
-    try {
-      const [revenue, income, balance, cash] = await Promise.all([
-        getFinMindFundamental(env, "TaiwanStockMonthRevenue", ticker),
-        getFinMindFundamental(env, "TaiwanStockFinancialStatements", ticker),
-        getFinMindFundamental(env, "TaiwanStockBalanceSheet", ticker),
-        getFinMindFundamental(env, "TaiwanStockCashFlowsStatement", ticker),
-      ]);
-      existing.metrics[ticker] = calculateFundamentalMetric(revenue, income, balance, cash);
-    } catch (error) {
-      warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
-    }
+  for (let offset = 0; offset < batch.length; offset += backfillConcurrency) {
+    await Promise.all(batch.slice(offset, offset + backfillConcurrency).map(async (ticker) => {
+      try {
+        const [revenue, income, balance, cash] = await Promise.all([
+          getFinMindFundamental(env, "TaiwanStockMonthRevenue", ticker),
+          getFinMindFundamental(env, "TaiwanStockFinancialStatements", ticker),
+          getFinMindFundamental(env, "TaiwanStockBalanceSheet", ticker),
+          getFinMindFundamental(env, "TaiwanStockCashFlowsStatement", ticker),
+        ]);
+        existing.metrics[ticker] = calculateFundamentalMetric(revenue, income, balance, cash);
+      } catch (error) {
+        warnings.push(`${ticker}：${errorMessage(error).slice(0, 120)}`);
+      }
+    }));
   }
   existing.version = 4;
   existing.updatedAt = new Date().toISOString();
