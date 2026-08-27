@@ -55,6 +55,16 @@ type FactorHistoryStore = {
   updatedAt: string;
   companies: Record<string, Record<string, FactorHistoryPoint[]>>;
 };
+type WeeklyValuationPoint = {
+  week: string;
+  capturedAt: string;
+  asOfDate: string | null;
+  closingPrice: number | null;
+  peRatio: number | null;
+  pbRatio: number | null;
+  dividendYield: number | null;
+};
+type WeeklyValuationStore = { version: 1; updatedAt: string; companies: Record<string, WeeklyValuationPoint[]> };
 const twseApi = "https://openapi.twse.com.tw/v1";
 const sp500Constituents = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv";
 const externalRequestTimeoutMs = 12_000;
@@ -65,6 +75,7 @@ const backfillBatchSize = 10;
 const backfillConcurrency = 2;
 const factorHistoryLimit = 48;
 const fundamentalHistoryFactorIds = new Set(["revenue-growth", "roe", "fcf", "roe-trend"]);
+const weeklyValuationFactorIds = new Set(["valuation", "pb"]);
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
@@ -531,6 +542,22 @@ function calendarDay(isoDate: string): string {
   return isoDate.slice(0, 10);
 }
 
+function taiwanWeekKey(isoDate: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" })
+    .formatToParts(new Date(isoDate));
+  const part = (type: Intl.DateTimeFormatPartTypes): string => parts.find((item) => item.type === type)?.value ?? "";
+  const date = new Date(`${part("year")}-${part("month")}-${part("day")}T00:00:00Z`);
+  const thursday = new Date(date);
+  thursday.setUTCDate(date.getUTCDate() + 3 - ((date.getUTCDay() + 6) % 7));
+  const firstThursday = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round((thursday.getTime() - firstThursday.getTime()) / 604_800_000);
+  return `${thursday.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+function isTaiwanWeeklyCloseCapture(isoDate: string): boolean {
+  return new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Taipei", weekday: "short" }).format(new Date(isoDate)) === "Sat";
+}
+
 function hasHistoricalFundamentals(metric: FundamentalMetric | undefined): boolean {
   if (!metric?.history?.length) return false;
   return metric.history.some((point) => point.period >= "2024-01-01"
@@ -560,11 +587,14 @@ async function appendFactorHistory(env: MarketEnv, companies: Company[], capture
       // replaced with repeated daily snapshots of the same fiscal period.
       if (fundamentalHistoryFactorIds.has(factor.id) && (factor.history?.length ?? 0) > 0) return factor;
       const points = factorHistory[factor.id] ?? [];
-      const point = historyPoint(factor, capturedAt);
+      if (weeklyValuationFactorIds.has(factor.id) && !isTaiwanWeeklyCloseCapture(capturedAt)) return { ...factor, history: points };
+      const point = historyPoint({ ...factor, period: weeklyValuationFactorIds.has(factor.id) ? taiwanWeekKey(capturedAt) : factor.period }, capturedAt);
       const lastPoint = points.at(-1);
-      const nextPoints = lastPoint && calendarDay(lastPoint.capturedAt) === captureDay
+      const captureKey = weeklyValuationFactorIds.has(factor.id) ? taiwanWeekKey(capturedAt) : captureDay;
+      const lastCaptureKey = lastPoint && (weeklyValuationFactorIds.has(factor.id) ? taiwanWeekKey(lastPoint.capturedAt) : calendarDay(lastPoint.capturedAt));
+      const nextPoints = lastPoint && lastCaptureKey === captureKey
         ? [...points.slice(0, -1), point]
-        : [...points, point].slice(-factorHistoryLimit);
+        : [...points, point].slice(-(weeklyValuationFactorIds.has(factor.id) ? 260 : factorHistoryLimit));
       factorHistory[factor.id] = nextPoints;
       return { ...factor, history: nextPoints };
     });
@@ -573,6 +603,26 @@ async function appendFactorHistory(env: MarketEnv, companies: Company[], capture
   store.updatedAt = capturedAt;
   await writeJsonBlob(env, "history/factors/taiwan.json", store);
   return companiesWithHistory;
+}
+
+async function appendWeeklyValuationHistory(env: MarketEnv, companies: Company[], capturedAt: string): Promise<void> {
+  if (!isTaiwanWeeklyCloseCapture(capturedAt)) return;
+  const store = await readJsonBlob<WeeklyValuationStore>(env, "history/valuations/taiwan.json")
+    ?? { version: 1, updatedAt: "", companies: {} };
+  const week = taiwanWeekKey(capturedAt);
+  for (const company of companies) {
+    if (company.market !== "台股" || !company.valuation) continue;
+    const points = store.companies[company.ticker] ?? [];
+    const nextPoint: WeeklyValuationPoint = {
+      week, capturedAt, asOfDate: company.valuation.asOfDate, closingPrice: company.valuation.closingPrice,
+      peRatio: company.valuation.peRatio, pbRatio: company.valuation.pbRatio, dividendYield: company.valuation.dividendYield,
+    };
+    store.companies[company.ticker] = points.at(-1)?.week === week
+      ? [...points.slice(0, -1), nextPoint]
+      : [...points, nextPoint].slice(-260);
+  }
+  store.updatedAt = capturedAt;
+  await writeJsonBlob(env, "history/valuations/taiwan.json", store);
 }
 
 export async function readFundamentalBackfillStatus(env: MarketEnv): Promise<FundamentalBackfillStatus> {
@@ -804,6 +854,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   if (fallbackUsCompanies.length > 0) sources.push("前次市場快照（已驗證 S&P 500 名單備援）");
   const generatedAt = new Date().toISOString();
   const twCompaniesWithHistory = await appendFactorHistory(env, twCompanies, generatedAt);
+  await appendWeeklyValuationHistory(env, twCompaniesWithHistory, generatedAt);
   const snapshot: MarketSnapshot = { generatedAt, sources, companies: [...twCompaniesWithHistory, ...usCompanies] };
   await writeSnapshot(env, snapshot);
   if (warnings.length > 0) {
