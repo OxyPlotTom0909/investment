@@ -531,6 +531,12 @@ function calendarDay(isoDate: string): string {
   return isoDate.slice(0, 10);
 }
 
+function hasHistoricalFundamentals(metric: FundamentalMetric | undefined): boolean {
+  if (!metric?.history?.length) return false;
+  return metric.history.some((point) => point.period >= "2024-01-01"
+    && (point.revenueYoY !== null || point.roeTtm !== null || point.fcfTtm !== null));
+}
+
 function historyPoint(factor: Factor, capturedAt: string): FactorHistoryPoint {
   return {
     capturedAt,
@@ -586,7 +592,8 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
     return metric === undefined
       || metric.calculationVersion !== 4
       || metric.netIncomeTtm === undefined
-      || metric.positiveNetIncomeQuarters === undefined;
+      || metric.positiveNetIncomeQuarters === undefined
+      || !hasHistoricalFundamentals(metric);
   });
   if (pending.length === 0) {
     await writeFundamentalBackfillStatus(env, { status: "success", startedAt: existing.updatedAt, finishedAt: new Date().toISOString(), completedCompanies: tickers.length, totalCompanies: tickers.length, currentTickers: [], warnings: [], error: null });
@@ -619,14 +626,16 @@ export async function runFundamentalBackfill(env: MarketEnv): Promise<void> {
     return metric !== undefined
       && metric.calculationVersion === 4
       && metric.netIncomeTtm !== undefined
-      && metric.positiveNetIncomeQuarters !== undefined;
+      && metric.positiveNetIncomeQuarters !== undefined
+      && hasHistoricalFundamentals(metric);
   }).length;
   const remainingTickers = tickers.filter((ticker) => {
     const metric = existing.metrics[ticker];
     return metric === undefined
       || metric.calculationVersion !== 4
       || metric.netIncomeTtm === undefined
-      || metric.positiveNetIncomeQuarters === undefined;
+      || metric.positiveNetIncomeQuarters === undefined
+      || !hasHistoricalFundamentals(metric);
   });
   await writeFundamentalBackfillStatus(env, {
     status: completedCompanies === tickers.length ? "success" : "running",
