@@ -64,6 +64,7 @@ const fundamentalStartDate = "2023-01-01";
 const backfillBatchSize = 10;
 const backfillConcurrency = 2;
 const factorHistoryLimit = 48;
+const fundamentalHistoryFactorIds = new Set(["revenue-growth", "roe", "fcf", "roe-trend"]);
 const factorNames = [
   ["revenue-growth", "營收成長率"], ["eps-growth", "EPS 成長"], ["roe", "ROE"],
   ["fcf", "自由現金流"], ["gross-margin", "毛利率"], ["operating-margin", "營業利益率"],
@@ -548,6 +549,10 @@ async function appendFactorHistory(env: MarketEnv, companies: Company[], capture
     const factorHistory = store.companies[company.ticker] ?? {};
     store.companies[company.ticker] = factorHistory;
     const factors = company.factors.map((factor) => {
+      // Fundamental metrics already carry their own source-period history
+      // (monthly revenue and quarterly TTM figures).  They must never be
+      // replaced with repeated daily snapshots of the same fiscal period.
+      if (fundamentalHistoryFactorIds.has(factor.id) && (factor.history?.length ?? 0) > 0) return factor;
       const points = factorHistory[factor.id] ?? [];
       const point = historyPoint(factor, capturedAt);
       const lastPoint = points.at(-1);
@@ -744,6 +749,7 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
   const twCompanies: Company[] = topTwCompanies.map((company) => {
     const peer = benchmarks.get(company.industry) ?? {};
     const fundamental = fundamentalStore.metrics[company.ticker];
+    const requiresFinancialModel = company.industry === "17";
     const valuation: Valuation = {
       asOfDate: company.priceDate,
       closingPrice: company.closingPrice,
@@ -770,7 +776,13 @@ export async function syncMarketSnapshot(env: MarketEnv): Promise<MarketSnapshot
     const factors = factorNames.map(([id, name]) => measured.find((factor) => factor.id === id) ?? unavailable(id, name));
     const evaluatedCount = factors.filter((factor) => factor.state !== "unavailable").length;
     const passedCount = factors.filter((factor) => factor.state === "pass").length;
-    return { ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors, evaluatedCount, passedCount, grade: grade(evaluatedCount, passedCount) };
+    // Financial companies require a separate model (bank, insurance, broker,
+    // and financial holding). Until that model and the matching official data
+    // are available, do not turn an incomplete general-industry score into C.
+    return {
+      ticker: company.ticker, name: company.name, market: "台股", industry: company.industry, currency: "TWD", valuation, factors,
+      evaluatedCount, passedCount, grade: requiresFinancialModel ? "資料不足" : grade(evaluatedCount, passedCount),
+    };
   });
 
   const fetchedUsCompanies: Company[] = sp500Companies.map(sp500Company);

@@ -33,11 +33,11 @@ test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async
   const worker = await loadWorker();
   const originalFetch = globalThis.fetch;
   const blobs = new Map([["history/fundamentals/metrics.json", {
-    version: 2,
+    version: 4,
     updatedAt: "2026-08-18T00:00:00.000Z",
     metrics: {
       2330: {
-        calculationVersion: 3,
+        calculationVersion: 4,
         revenueYoY: 12,
         roeTtm: 20,
         roeTtmPriorYear: 18,
@@ -45,6 +45,11 @@ test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async
         netIncomeTtm: 120000000,
         positiveNetIncomeQuarters: 4,
         asOfDate: "2026-06-30",
+        history: [
+          { period: "2024-03-31", revenueYoY: 10, roeTtm: 16, roeTtmPriorYear: 14, fcfTtm: 80000000 },
+          { period: "2024-06-30", revenueYoY: 11, roeTtm: 18, roeTtmPriorYear: 15, fcfTtm: 90000000 },
+          { period: "2026-06-30", revenueYoY: 12, roeTtm: 20, roeTtmPriorYear: 18, fcfTtm: 100000000 },
+        ],
         updatedAt: "2026-08-18T00:00:00.000Z",
       },
     },
@@ -105,8 +110,8 @@ test("排程在補充來源失敗時仍寫入台股快照與同步狀態", async
   assert.equal(moat.value, "2/2 項量化佐證");
   assert.deepEqual(moat.evidence.map((item) => item.criterion), ["獲利持續性", "資本效率"]);
   assert.ok(moat.evidence.every((item) => item.asOfDate === "2026-06-30" && item.confidence === "high" && item.sourceUrl.startsWith("https://")));
-  assert.deepEqual(roe.history, [{ capturedAt: snapshot.generatedAt, state: "pass", value: "20.00%", benchmark: "同業中位數 20.00%", period: "2026-06-30" }]);
-  assert.equal(blobs.get("history/factors/taiwan.json").companies[2330].roe.length, 1);
+  assert.deepEqual(roe.history.map((point) => point.period), ["2024-03-31", "2024-06-30", "2026-06-30"]);
+  assert.equal(blobs.get("history/factors/taiwan.json").companies[2330].roe, undefined);
   assert.equal(status.status, "success");
   assert.match(status.warnings.join(" "), /FinMind/);
   assert.match(status.warnings.join(" "), /S&P 500/);
